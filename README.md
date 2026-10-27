@@ -74,3 +74,12 @@ Lo storico di ogni scansione finisce in `data/scans.csv`.
 - Questo scanner rileva e misura le opportunità, **non esegue operazioni**.
 - I token Coinbase sono offerti solo in giurisdizioni idonee fuori dagli USA (Reg. S). Verifica di poterli detenere.
 - Non è consulenza finanziaria.
+
+## App Android
+
+La cartella `android/` contiene un'app nativa che fa le stesse scansioni direttamente dal telefono:
+- scansiona ogni 15 minuti in background, con notifiche locali e senza server;
+- mostra la lista dei token con gap, direzione, size ottimale e profitto netto;
+- si regola dalle impostazioni nell'app: capitale, soglie e commissioni.
+
+L'APK viene compilato da GitHub Actions (`.github/workflows/android.yml`) a ogni modifica e pubblicato nelle [Release](../../releases/latest).
