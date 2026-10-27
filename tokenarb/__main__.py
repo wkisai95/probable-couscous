@@ -2,6 +2,7 @@
 
   python -m tokenarb scan           # una scansione (usata da GitHub Actions)
   python -m tokenarb run            # loop continuo ogni 15 minuti
+  python -m tokenarb tokens         # elenca tutti i token Coinbase su Base
   python -m tokenarb test-notify    # invia un messaggio di prova
 """
 from __future__ import annotations
@@ -39,7 +40,7 @@ def run_once(cfg: dict, notify: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="tokenarb")
-    p.add_argument("command", choices=["scan", "run", "test-notify"])
+    p.add_argument("command", choices=["scan", "run", "tokens", "test-notify"])
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--no-notify", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -54,6 +55,14 @@ def main() -> None:
         return
     if a.command == "scan":
         run_once(cfg, notify=not a.no_notify)
+        return
+    if a.command == "tokens":
+        from .coinbase import list_tokens
+        toks = list_tokens()
+        for t in sorted(toks, key=lambda x: x.symbol):
+            print(f"{t.symbol:<10}{t.name[:40]:<42}{t.multiplier:>8.4f}  {t.address}"
+                  f"{'  [PAUSA ' + str(t.paused_features) + ']' if t.paused_features else ''}")
+        print(f"\n{len(toks)} token Coinbase su Base")
         return
 
     interval = int(cfg.get("interval_minutes", 15)) * 60

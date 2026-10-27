@@ -3,11 +3,13 @@
 interval_minutes: 15          # loop locale (`python -m tokenarb run`)
 reference_source: yahoo       # yahoo (gratuito, con pre/after-market) | finnhub (FINNHUB_API_KEY)
 
-# Ticker da monitorare. Vuoto = tutti i token restituiti dall'API Coinbase.
-# Lancio (ago 2026): AAPL AMZN GOOGL META MSFT MSTR NVDA SNDK SPCX TSLA
+# Ticker da monitorare. Vuoto = TUTTI i token Coinbase, scoperti a ogni scansione
+# dall'API ufficiale (i nuovi listing entrano in automatico).
+# `python -m tokenarb tokens` mostra l'elenco attuale.
 tickers: []
+exclude_tickers: []
 
-# Simbolo Yahoo se diverso dal ticker
+# Simbolo Yahoo se diverso dal ticker (BRK.B -> BRK-B è già automatico)
 yahoo_symbols: {}
 
 # Sessioni in cui è possibile coprirsi in Borsa (aggiungere pre/post se il broker lo consente)
@@ -26,7 +28,9 @@ dex:
   delay_seconds: 0.35         # pausa tra richieste per evitare rate limit
 
 # Feed Chainlink "Base Tokenized Equities" (prezzo per token, 8 decimali)
-# Usati come controllo incrociato e come riserva se Yahoo non risponde.
+# Facoltativi: controllo incrociato e riserva se Yahoo non risponde.
+# I token senza feed usano solo Yahoo/Finnhub. Aggiungere qui i nuovi feed
+# da https://docs.chain.link/data-feeds/tokenized-equity-feeds/coinbase
 chainlink_feeds:
   AAPL: "0x787f13dEa48Db0897CbCDD985de77809D837F988"
   AMZN: "0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295"

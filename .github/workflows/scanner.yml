@@ -12,7 +12,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 14   # con decine di token servono più quote; resta sotto i 15 min
     steps:
       - uses: actions/checkout@v4
 

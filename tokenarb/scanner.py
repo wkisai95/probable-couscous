@@ -47,6 +47,11 @@ def make_quote_fn(dex, token: CbToken, usdc: dict) -> sizing.QuoteFn:
     return q
 
 
+def yahoo_symbol(ticker: str, overrides: Dict[str, str]) -> str:
+    """BRK.B -> BRK-B (formato Yahoo), salvo override in config."""
+    return overrides.get(ticker, ticker.replace(".", "-").replace("/", "-"))
+
+
 def _age_min(now: datetime, ts: datetime) -> float:
     return (now - ts).total_seconds() / 60
 
@@ -82,7 +87,10 @@ def scan(cfg: dict,
     wanted = set(cfg.get("tickers") or [])
     if wanted:
         tokens = [t for t in tokens if t.ticker in wanted]
-    ysyms: Dict[str, str] = {t.ticker: (cfg.get("yahoo_symbols") or {}).get(t.ticker, t.ticker)
+    exclude = set(cfg.get("exclude_tickers") or [])
+    tokens = [t for t in tokens if t.ticker not in exclude]
+    log.info("%d token Coinbase da analizzare", len(tokens))
+    ysyms: Dict[str, str] = {t.ticker: yahoo_symbol(t.ticker, cfg.get("yahoo_symbols") or {})
                              for t in tokens}
     ws_refs = wallstreet_fn(ysyms, cfg.get("reference_source", "yahoo"))
     feeds = {k: v for k, v in (cfg.get("chainlink_feeds") or {}).items() if k in ysyms}

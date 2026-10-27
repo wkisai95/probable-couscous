@@ -4,7 +4,11 @@ Scanner **on-chain su Base** che confronta i **tokenized stocks emessi da Coinba
 
 ## Come funziona
 
-1. **Solo token Coinbase.** La lista arriva dall'API ufficiale `api.coinbase.com/v1/tokenized-stocks`, che dà indirizzo, decimali e `multiplier` di ogni token. I token sono identificati per indirizzo, quindi eventuali copie con lo stesso ticker vengono ignorate.
+1. **Solo token Coinbase, tutti.** A ogni scansione la lista completa viene scaricata dall'API ufficiale `api.coinbase.com/v1/tokenized-stocks`, leggendo tutte le pagine. Ogni token arriva con indirizzo, decimali e `multiplier`.
+   - I nuovi listing entrano da soli, senza toccare il codice.
+   - I token sono identificati per indirizzo, quindi copie con lo stesso ticker ed emittenti diversi da Coinbase vengono ignorati.
+   - I token senza liquidità on-chain vengono saltati.
+   - `python -m tokenarb tokens` mostra l'elenco aggiornato.
 2. **Prezzo on-chain eseguibile.** Le quote arrivano dall'aggregatore KyberSwap su Base, che instrada su Aerodrome, Uniswap e gli altri pool. Il prezzo include già fee dei pool, slippage reale per la size e costo del gas.
 3. **Prezzo equo per token:**
 

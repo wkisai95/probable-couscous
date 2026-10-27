@@ -49,6 +49,11 @@ def test_ticker_and_parse():
     assert (t.ticker, t.multiplier, t.nav_price) == ("NVDA", 1.02, 190.5)
 
 
+def test_yahoo_symbol():
+    assert scanner.yahoo_symbol("BRK.B", {}) == "BRK-B"
+    assert scanner.yahoo_symbol("SPCX", {"SPCX": "XYZ"}) == "XYZ"
+
+
 def test_direction():
     assert sizing.direction_for(98, 97.5, 100) == sizing.BUY_TOKEN
     assert sizing.direction_for(102.5, 102, 100) == sizing.SELL_TOKEN
