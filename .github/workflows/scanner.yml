@@ -3,7 +3,13 @@ name: Coinbase tokenized stocks (Base) arbitrage scanner
 on:
   schedule:
     - cron: "*/15 * * * *"   # ogni 15 minuti (GitHub può ritardare di qualche minuto)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "scan = scansione · tokens = elenco token Coinbase con i pool DEX"
+        type: choice
+        options: [scan, tokens]
+        default: scan
 
 concurrency:
   group: tokenarb-scanner
@@ -48,7 +54,13 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        run: python -m tokenarb scan
+          CMD: ${{ inputs.command }}
+        run: |
+          if [ "$CMD" = "tokens" ]; then
+            python -m tokenarb tokens --liquidity
+          else
+            python -m tokenarb scan
+          fi
 
       - name: Upload scan log
         uses: actions/upload-artifact@v4

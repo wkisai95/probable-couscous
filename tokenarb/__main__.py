@@ -54,7 +54,8 @@ def github_summary(opps, records) -> None:
             f"  {'OK ' if o.actionable else ''}{(b.direction if b else '-')} {'; '.join(o.notes)[:80]}")
     info = [r.getMessage() for r in records if r.levelno == logging.INFO]
     warns = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
-    head = "\n".join(m for m in info if "token" in m.lower() or "opportunità" in m)
+    head = "\n".join(m for m in info if "token" in m.lower() or "opportunità" in m
+                     or m.startswith("Senza"))
     print(f"::notice title=Scansione::{_gh_escape(head + chr(10) + chr(10).join(lines))}")
     if warns:
         print(f"::warning title=Avvisi ({len(warns)})::{_gh_escape(chr(10).join(warns[:80]))}")
@@ -64,6 +65,48 @@ def github_summary(opps, records) -> None:
             fh.write(f"### Scansione tokenarb\n\n{head}\n\n```\n" + "\n".join(lines) + "\n```\n")
             if warns:
                 fh.write("\n<details><summary>Avvisi</summary>\n\n```\n" + "\n".join(warns) + "\n```\n</details>\n")
+
+
+def list_tokens_cmd(with_liquidity: bool) -> None:
+    from .coinbase import list_tokens
+
+    toks = sorted(list_tokens(), key=lambda x: x.symbol)
+    liq = {}
+    if with_liquidity:
+        from .liquidity import token_pools
+        liq = token_pools([t.address for t in toks])
+    lines = []
+    for t in toks:
+        line = f"{t.symbol:<9}{t.multiplier:>7.4f}  {t.address}"
+        if t.paused_features:
+            line += f"  [PAUSA {t.paused_features}]"
+        info = liq.get(t.address.lower())
+        if info is not None:
+            line += (f"  pool={len(info.pools)} liq=${info.total_usd:,.0f} "
+                     f"{'/'.join(info.dexes())}")
+        lines.append(line)
+    print("\n".join(lines))
+    print(f"\n{len(toks)} token Coinbase su Base")
+    if with_liquidity and os.getenv("GITHUB_ACTIONS") == "true":
+        ranked = sorted(toks, key=lambda t: -(liq[t.address.lower()].total_usd
+                                              if t.address.lower() in liq else 0))
+        with_pools = [t for t in ranked if liq.get(t.address.lower()) and liq[t.address.lower()].pools]
+        dex_count: dict = {}
+        for t in with_pools:
+            for d in liq[t.address.lower()].dexes():
+                dex_count[d] = dex_count.get(d, 0) + 1
+        head = (f"{len(toks)} token Coinbase, {len(with_pools)} con pool DEX su Base\n"
+                f"Token per DEX: " + ", ".join(f"{d}={n}" for d, n in
+                                               sorted(dex_count.items(), key=lambda x: -x[1])))
+        rows = []
+        for t in with_pools:
+            i = liq[t.address.lower()]
+            top = max(i.pools, key=lambda p: p.reserve_usd)
+            rows.append(f"{t.symbol:<9} liq=${i.total_usd:>12,.0f}  pool={len(i.pools)}  "
+                        f"top={top.dex} {top.name} vol24h=${top.volume_24h_usd:,.0f}")
+        no_pools = [t.symbol for t in toks if t not in with_pools]
+        print(f"::notice title=Liquidità token::{_gh_escape(head + chr(10) + chr(10).join(rows))}")
+        print(f"::notice title=Senza pool ({len(no_pools)})::{_gh_escape(', '.join(no_pools))}")
 
 
 def run_once(cfg: dict, notify: bool) -> None:
@@ -90,6 +133,8 @@ def main() -> None:
     p.add_argument("command", choices=["scan", "run", "tokens", "test-notify"])
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--no-notify", action="store_true")
+    p.add_argument("--liquidity", action="store_true",
+                   help="con 'tokens': mostra i pool DEX di ogni token (GeckoTerminal)")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -104,12 +149,7 @@ def main() -> None:
         run_once(cfg, notify=not a.no_notify)
         return
     if a.command == "tokens":
-        from .coinbase import list_tokens
-        toks = list_tokens()
-        for t in sorted(toks, key=lambda x: x.symbol):
-            print(f"{t.symbol:<10}{t.name[:40]:<42}{t.multiplier:>8.4f}  {t.address}"
-                  f"{'  [PAUSA ' + str(t.paused_features) + ']' if t.paused_features else ''}")
-        print(f"\n{len(toks)} token Coinbase su Base")
+        list_tokens_cmd(with_liquidity=a.liquidity)
         return
 
     interval = int(cfg.get("interval_minutes", 15)) * 60

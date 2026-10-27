@@ -14,18 +14,15 @@ log = logging.getLogger(__name__)
 LATEST_ROUND_DATA = "0xfeaf968c"  # selector di latestRoundData()
 
 
-def fetch_yahoo(symbols: Dict[str, str]) -> Dict[str, RefQuote]:
-    """symbols: {ticker: simbolo_yahoo}. Ultimo prezzo a 1 min con pre/after-market."""
+def _yahoo_download(symbols: Dict[str, str], period: str) -> Dict[str, RefQuote]:
     import yfinance as yf
 
-    ysyms = list(symbols.values())
     out: Dict[str, RefQuote] = {}
-    df = None
-    for period in ("1d", "5d"):  # a mercato chiuso '1d' può essere vuoto
-        df = yf.download(ysyms, period=period, interval="1m", prepost=True,
-                         group_by="ticker", progress=False, auto_adjust=False)
-        if df is not None and not df.empty:
-            break
+    ysyms = list(dict.fromkeys(symbols.values()))
+    if not ysyms:
+        return out
+    df = yf.download(ysyms, period=period, interval="1m", prepost=True,
+                     group_by="ticker", progress=False, auto_adjust=False, threads=True)
     if df is None or df.empty:
         return out
     for t, ys in symbols.items():
@@ -40,8 +37,25 @@ def fetch_yahoo(symbols: Dict[str, str]) -> Dict[str, RefQuote]:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             out[t] = RefQuote(t, float(closes.iloc[-1]), ts, "yahoo")
-        except Exception as e:  # noqa: BLE001
-            log.warning("Yahoo %s: %s", ys, e)
+        except Exception:  # noqa: BLE001 - ticker assente nel risultato
+            continue
+    return out
+
+
+def fetch_yahoo(symbols: Dict[str, str]) -> Dict[str, RefQuote]:
+    """symbols: {ticker: simbolo_yahoo}. Ultimo prezzo a 1 min con pre/after-market.
+
+    Primo passaggio sulla giornata; i titoli senza scambi oggi (tipico in
+    pre-market o a mercato chiuso) vengono ripresi sugli ultimi 5 giorni.
+    """
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # evita centinaia di righe di rumore
+    out = _yahoo_download(symbols, "1d")
+    missing = {t: s for t, s in symbols.items() if t not in out}
+    if missing:
+        out.update(_yahoo_download(missing, "5d"))
+    still = sorted(t for t in symbols if t not in out)
+    if still:
+        log.warning("Yahoo: nessun prezzo per %d titoli: %s", len(still), ", ".join(still))
     return out
 
 
