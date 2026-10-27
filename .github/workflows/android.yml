@@ -27,30 +27,58 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
-      # Firma: con i secret ANDROID_KEYSTORE_B64 & co. usa la tua chiave;
-      # altrimenti una chiave debug conservata in cache, così gli aggiornamenti
-      # si installano sopra la versione precedente.
-      - name: Restore debug keystore
+      # Firma stabile: ogni versione deve avere la stessa chiave, altrimenti
+      # Android rifiuta l'aggiornamento. Con i secret ANDROID_KEYSTORE_B64 & co.
+      # usa la tua chiave; altrimenti una chiave generata una volta e conservata
+      # nella cache del repository (privata ai workflow).
+      - name: Restore signing key
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: android-debug-keystore-v1
+          path: ~/.tokenarb-signing/release.jks
+          key: tokenarb-signing-key-v1
 
-      - name: Decode release keystore
+      - name: Prepare signing key
         env:
           KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           if [ -n "$KS_B64" ]; then
             echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "ANDROID_KEYSTORE_PASSWORD=$KS_PASS"
+              echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$KEY_PASS"
+            } >> "$GITHUB_ENV"
+          else
+            KS="$HOME/.tokenarb-signing/release.jks"
+            if [ ! -f "$KS" ]; then
+              mkdir -p "$(dirname "$KS")"
+              keytool -genkeypair -keystore "$KS" -storetype PKCS12 -alias tokenarb \
+                -keyalg RSA -keysize 4096 -validity 10000 \
+                -storepass tokenarb-ci -keypass tokenarb-ci -dname "CN=TokenArb, O=wkisai95, C=IT"
+              echo "::notice title=Firma::Creata una nuova chiave di firma (conservata in cache)"
+            fi
+            {
+              echo "ANDROID_KEYSTORE_PATH=$KS"
+              echo "ANDROID_KEYSTORE_PASSWORD=tokenarb-ci"
+              echo "ANDROID_KEY_ALIAS=tokenarb"
+              echo "ANDROID_KEY_PASSWORD=tokenarb-ci"
+            } >> "$GITHUB_ENV"
           fi
 
       - name: Build
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle -p android assembleRelease --stacktrace
+
+      - name: Signing fingerprint
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          FP=$("$BT/apksigner" verify --print-certs android/app/build/outputs/apk/release/app-release.apk \
+               | grep -m1 "SHA-256" | awk '{print $NF}')
+          echo "Certificato SHA-256: $FP"
+          echo "::notice title=Certificato di firma::SHA-256 $FP"
 
       - name: Rename APK
         run: cp android/app/build/outputs/apk/release/app-release.apk TokenArb.apk
