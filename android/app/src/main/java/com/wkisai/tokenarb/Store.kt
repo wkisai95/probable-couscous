@@ -2,7 +2,9 @@ package com.wkisai.tokenarb
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 /** Impostazioni modificabili dall'app. */
 data class Settings(
@@ -17,6 +19,8 @@ data class Settings(
     val halfSpreadExtended: Double = 15.0,
     val maxRefAgeMin: Double = 20.0,
     val cooldownMin: Double = 60.0,
+    val closeTolBps: Double = 10.0,    // gap considerato chiuso entro questi bps
+    val minExitPct: Double = 10.0,     // avvisa se si può vendere almeno questa % della posizione
     val extendedTradable: Boolean = false,
     val notifications: Boolean = true,
     val buyOnly: Boolean = true,       // solo arbitraggi in cui conviene comprare il token
@@ -30,7 +34,10 @@ data class Settings(
 object Store {
     private const val PREFS = "tokenarb"
     const val KEY_RESULTS = "last_scan"
+    const val KEY_POSITIONS = "positions"
+    const val KEY_POS_STATUS = "position_status"
     private const val KEY_ALERTS = "alerts"
+    private val lock = Any()
 
     fun prefs(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -53,6 +60,8 @@ object Store {
             halfSpreadExtended = p.d("halfSpreadExtended", d.halfSpreadExtended),
             maxRefAgeMin = p.d("maxRefAgeMin", d.maxRefAgeMin),
             cooldownMin = p.d("cooldownMin", d.cooldownMin),
+            closeTolBps = p.d("closeTolBps", d.closeTolBps),
+            minExitPct = p.d("minExitPct", d.minExitPct),
             extendedTradable = p.getBoolean("extendedTradable", d.extendedTradable),
             notifications = p.getBoolean("notifications", d.notifications),
             buyOnly = p.getBoolean("buyOnly", d.buyOnly),
@@ -61,6 +70,7 @@ object Store {
         )
     }
 
+    // ------------------------------------------------------------ risultati
     fun saveResults(ctx: Context, o: ScanOutcome) {
         prefs(ctx).edit().putString(KEY_RESULTS, o.toJson().toString()).apply()
     }
@@ -81,13 +91,16 @@ object Store {
         null
     }
 
-    /** Stato tra le scansioni: elenco token in cache e token senza liquidità. */
+    // ------------------------------------------------------------ stato tra le scansioni
+    /** Elenco token in cache, token senza percorso di scambio, scoperta GeckoTerminal in cache. */
     fun loadState(ctx: Context): Scanner.State {
         val p = prefs(ctx)
         return Scanner.State(
-            p.getString("tokens_cache", null),
-            p.getLong("tokens_cache_at", 0L),
-            java.util.concurrent.ConcurrentHashMap(loadNoRoute(ctx)),
+            tokensJson = p.getString("tokens_cache", null),
+            tokensAt = p.getLong("tokens_cache_at", 0L),
+            noRoute = ConcurrentHashMap(loadNoRoute(ctx)),
+            discoveryJson = p.getString("discovery_cache", null),
+            discoveryAt = p.getLong("discovery_cache_at", 0L),
         )
     }
 
@@ -95,12 +108,13 @@ object Store {
         prefs(ctx).edit()
             .putString("tokens_cache", st.tokensJson)
             .putLong("tokens_cache_at", st.tokensAt)
+            .putString("discovery_cache", st.discoveryJson)
+            .putLong("discovery_cache_at", st.discoveryAt)
             .apply()
         saveNoRoute(ctx, st.noRoute)
     }
 
-    /** Token senza liquidità on-chain: indirizzo -> momento in cui ricontrollarli. */
-    fun loadNoRoute(ctx: Context): MutableMap<String, Long> {
+    private fun loadNoRoute(ctx: Context): MutableMap<String, Long> {
         val out = mutableMapOf<String, Long>()
         try {
             val o = JSONObject(prefs(ctx).getString("no_route", "{}") ?: "{}")
@@ -111,12 +125,70 @@ object Store {
         return out
     }
 
-    fun saveNoRoute(ctx: Context, m: Map<String, Long>) {
+    private fun saveNoRoute(ctx: Context, m: Map<String, Long>) {
         val o = JSONObject()
         m.forEach { (k, v) -> o.put(k, v) }
         prefs(ctx).edit().putString("no_route", o.toString()).apply()
     }
 
+    // ------------------------------------------------------------ posizioni
+    fun loadPositions(ctx: Context): List<Position> = try {
+        val arr = JSONArray(prefs(ctx).getString(KEY_POSITIONS, "[]") ?: "[]")
+        (0 until arr.length()).mapNotNull {
+            try { Position.fromJson(arr.getJSONObject(it)) } catch (e: Exception) { null }
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun savePositions(ctx: Context, list: List<Position>) {
+        val arr = JSONArray().apply { list.forEach { put(it.toJson()) } }
+        prefs(ctx).edit().putString(KEY_POSITIONS, arr.toString()).commit()
+    }
+
+    fun addPosition(ctx: Context, p: Position) = synchronized(lock) {
+        savePositions(ctx, loadPositions(ctx) + p)
+    }
+
+    /** Modifica una posizione; se [transform] restituisce null la posizione viene eliminata. */
+    fun updatePosition(ctx: Context, id: String, transform: (Position) -> Position?) = synchronized(lock) {
+        val list = loadPositions(ctx).mapNotNull { if (it.id == id) transform(it) else it }
+        savePositions(ctx, list)
+        // dopo una vendita o un'eliminazione gli avvisi ripartono da zero
+        val st = loadStatusesUnlocked(ctx).toMutableMap()
+        st.remove(id)
+        saveStatuses(ctx, st.filterKeys { k -> list.any { it.id == k } })
+    }
+
+    fun loadStatuses(ctx: Context): Map<String, PositionStatus> = synchronized(lock) { loadStatusesUnlocked(ctx) }
+
+    private fun loadStatusesUnlocked(ctx: Context): Map<String, PositionStatus> = try {
+        val o = JSONObject(prefs(ctx).getString(KEY_POS_STATUS, "{}") ?: "{}")
+        val out = mutableMapOf<String, PositionStatus>()
+        o.keys().forEach { k ->
+            val st = try { PositionStatus.fromJson(o.getJSONObject(k)) } catch (e: Exception) { null }
+            if (st != null) out[k] = st
+        }
+        out
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    private fun saveStatuses(ctx: Context, m: Map<String, PositionStatus>) {
+        val o = JSONObject()
+        m.forEach { (k, v) -> o.put(k, v.toJson()) }
+        prefs(ctx).edit().putString(KEY_POS_STATUS, o.toString()).commit()
+    }
+
+    /** Aggiorna gli esiti dei controlli, solo per le posizioni ancora presenti. */
+    fun mergeStatuses(ctx: Context, updates: List<PositionStatus>) = synchronized(lock) {
+        val ids = loadPositions(ctx).map { it.id }.toSet()
+        val m = loadStatusesUnlocked(ctx).toMutableMap()
+        updates.forEach { if (it.id in ids) m[it.id] = it }
+        saveStatuses(ctx, m.filterKeys { it in ids })
+    }
+
+    // ------------------------------------------------------------ avvisi opportunità
     fun loadAlerts(ctx: Context): JSONObject = try {
         JSONObject(prefs(ctx).getString(KEY_ALERTS, "{}") ?: "{}")
     } catch (e: Exception) {

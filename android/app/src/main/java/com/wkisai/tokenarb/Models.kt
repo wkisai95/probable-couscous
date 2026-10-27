@@ -47,8 +47,13 @@ data class RefQuote(
     val perToken: Boolean = false,
 )
 
-/** Liquidità e prezzo medio del pool principale (GeckoTerminal). */
-data class PoolData(val priceUsd: Double?, val reserveUsd: Double, val hasPools: Boolean)
+/** Prezzo e liquidità della pool token/USDC scelta per un token. */
+data class PoolPrice(
+    val priceUsd: Double,
+    val liquidityUsd: Double,
+    val dex: String,          // es. "aerodrome v3"
+    val pair: String?,        // indirizzo della pool
+)
 
 data class SizeResult(
     val direction: String,
@@ -95,13 +100,16 @@ data class Opportunity(
     val refAgeMin: Double,
     val dexBuy: Double?,         // prezzo eseguibile di acquisto (size piccola), se quotato
     val dexSell: Double?,        // prezzo eseguibile di vendita (size piccola), se quotato
-    val poolPrice: Double?,      // prezzo medio del pool principale (indicativo)
+    val poolPrice: Double?,      // prezzo nella pool token/USDC (DexScreener)
     val liquidityUsd: Double?,
+    val dex: String?,
+    val pair: String?,
     val gapBps: Double,
     val chainlink: Double?,
     val best: SizeResult?,
     val fixed: SizeResult?,
     val actionable: Boolean,
+    val verified: Boolean,       // size verificata con quote on-chain
     val notes: List<String>,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
@@ -110,9 +118,12 @@ data class Opportunity(
         put("refAge", refAgeMin); put("gap", gapBps)
         putD("buy", dexBuy); putD("sell", dexSell); putD("pool", poolPrice)
         putD("liq", liquidityUsd); putD("chainlink", chainlink)
+        dex?.let { put("dex", it) }
+        pair?.let { put("pair", it) }
         best?.let { put("best", it.toJson()) }
         fixed?.let { put("fixed", it.toJson()) }
         put("actionable", actionable)
+        put("verified", verified)
         put("notes", JSONArray(notes))
     }
 
@@ -120,14 +131,17 @@ data class Opportunity(
         fun fromJson(o: JSONObject): Opportunity {
             val n = o.optJSONArray("notes") ?: JSONArray()
             return Opportunity(
-                o.getString("ticker"), o.getString("symbol"), o.getString("address"),
-                o.getString("session"), o.getDouble("fair"), o.getString("refSource"),
-                o.getDouble("refAge"), o.optD("buy"), o.optD("sell"), o.optD("pool"),
-                o.optD("liq"), o.getDouble("gap"), o.optD("chainlink"),
-                SizeResult.fromJson(o.optJSONObject("best")),
-                SizeResult.fromJson(o.optJSONObject("fixed")),
-                o.optBoolean("actionable"),
-                (0 until n.length()).map { n.getString(it) },
+                ticker = o.getString("ticker"), symbol = o.getString("symbol"),
+                address = o.getString("address"), session = o.getString("session"),
+                fairPrice = o.getDouble("fair"), refSource = o.getString("refSource"),
+                refAgeMin = o.getDouble("refAge"), dexBuy = o.optD("buy"), dexSell = o.optD("sell"),
+                poolPrice = o.optD("pool"), liquidityUsd = o.optD("liq"),
+                dex = o.optString("dex").ifEmpty { null }, pair = o.optString("pair").ifEmpty { null },
+                gapBps = o.getDouble("gap"), chainlink = o.optD("chainlink"),
+                best = SizeResult.fromJson(o.optJSONObject("best")),
+                fixed = SizeResult.fromJson(o.optJSONObject("fixed")),
+                actionable = o.optBoolean("actionable"), verified = o.optBoolean("verified", true),
+                notes = (0 until n.length()).map { n.getString(it) },
             )
         }
     }
@@ -142,12 +156,14 @@ data class ScanOutcome(
     val inProgress: Boolean = false,
     val progress: String = "",
     val durationSec: Int = 0,
+    val feedInfo: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("time", timeMillis); put("session", session); put("tokens", tokensFound)
         put("opps", JSONArray().apply { opportunities.forEach { put(it.toJson()) } })
         put("errors", JSONArray(errors))
         put("inProgress", inProgress); put("progress", progress); put("duration", durationSec)
+        put("feed", feedInfo)
     }
 
     companion object {
@@ -161,7 +177,64 @@ data class ScanOutcome(
                 },
                 (0 until e.length()).map { e.getString(it) },
                 o.optBoolean("inProgress"), o.optString("progress"), o.optInt("duration"),
+                o.optString("feed"),
             )
         }
+    }
+}
+
+/** Acquisto registrato dall'utente con il pulsante "Ho comprato". */
+data class Position(
+    val id: String,
+    val address: String,
+    val symbol: String,
+    val ticker: String,
+    val usd: Double,          // costo residuo in USD
+    val entryPrice: Double,   // prezzo medio pagato per token
+    val tokens: Double,       // token residui
+    val openedAt: Long,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id); put("address", address); put("symbol", symbol); put("ticker", ticker)
+        put("usd", usd); put("entry", entryPrice); put("tokens", tokens); put("openedAt", openedAt)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject) = Position(
+            o.getString("id"), o.getString("address"), o.getString("symbol"), o.getString("ticker"),
+            o.getDouble("usd"), o.getDouble("entry"), o.getDouble("tokens"), o.getLong("openedAt"),
+        )
+    }
+}
+
+/** Esito dell'ultimo controllo di una posizione: quanto si può vendere chiudendo il gap. */
+data class PositionStatus(
+    val id: String,
+    val at: Long,
+    val fair: Double?,            // prezzo di Borsa per token
+    val poolPrice: Double?,       // prezzo nella pool (indicativo)
+    val fraction: Double,         // quota vendibile chiudendo il gap: 0, 0.1 … 1.0
+    val sellTokens: Double?,
+    val proceedsUsd: Double?,     // incasso netto stimato (gas escluso)
+    val avgSellPrice: Double?,
+    val pnlUsd: Double?,          // risultato sulla quota vendibile rispetto al prezzo pagato
+    val note: String?,
+    val notifiedFraction: Double = 0.0,
+    val notifiedAt: Long = 0L,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id); put("at", at); putD("fair", fair); putD("pool", poolPrice)
+        put("fraction", fraction); putD("sellTokens", sellTokens); putD("proceeds", proceedsUsd)
+        putD("avg", avgSellPrice); putD("pnl", pnlUsd); note?.let { put("note", it) }
+        put("nf", notifiedFraction); put("na", notifiedAt)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject) = PositionStatus(
+            o.getString("id"), o.getLong("at"), o.optD("fair"), o.optD("pool"),
+            o.optDouble("fraction", 0.0), o.optD("sellTokens"), o.optD("proceeds"), o.optD("avg"),
+            o.optD("pnl"), o.optString("note").ifEmpty { null },
+            o.optDouble("nf", 0.0), o.optLong("na", 0L),
+        )
     }
 }

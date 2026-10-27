@@ -38,6 +38,8 @@ class SettingsActivity : Activity() {
             Field("halfSpreadExtended", "Metà spread azione, pre/after (bps)", fmt(s.halfSpreadExtended)),
             Field("maxRefAgeMin", "Età massima prezzo di Borsa (min)", fmt(s.maxRefAgeMin)),
             Field("cooldownMin", "Pausa tra notifiche uguali (min)", fmt(s.cooldownMin)),
+            Field("closeTolBps", "Posizioni: gap considerato chiuso entro (bps)", fmt(s.closeTolBps)),
+            Field("minExitPct", "Posizioni: avvisami se posso vendere almeno il (%)", fmt(s.minExitPct)),
             Field("tickers", "Solo questi ticker (vuoto = tutti, es. AAPL,NVDA)", s.tickers, false),
             Field("exclude", "Escludi ticker", s.exclude, false),
         )

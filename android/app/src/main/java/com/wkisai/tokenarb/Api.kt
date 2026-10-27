@@ -7,6 +7,10 @@ import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class HttpError(val status: Int, val body: String) : RuntimeException("HTTP $status: ${body.take(160)}")
 
@@ -136,25 +140,99 @@ object Api {
         return out
     }
 
+    // ---------------------------------------------------------------- DexScreener
+    private const val DEXSCREENER = "https://api.dexscreener.com/tokens/v1/base/"
+    private val USDC_LC = USDC.lowercase()
+
+    private fun isAero(p: PoolPrice) = p.dex.lowercase().contains("aero")
+
+    /** true se la pool [x] è preferibile a [y]: prima Aero, poi la più liquida. */
+    private fun better(x: PoolPrice, y: PoolPrice): Boolean =
+        if (isAero(x) != isAero(y)) isAero(x) else x.liquidityUsd > y.liquidityUsd
+
+    /**
+     * Prezzo di ogni token nella sua pool token/USDC (Aero preferita) da DexScreener.
+     * Richieste parallele da 30 indirizzi: ~0,2 s per tutti i token. -> (prezzi, richieste fallite)
+     */
+    fun dexscreener(addresses: List<String>): Pair<Map<String, PoolPrice>, Int> {
+        val out = ConcurrentHashMap<String, PoolPrice>()
+        val failed = AtomicInteger(0)
+        val chunks = addresses.chunked(30)
+        if (chunks.isEmpty()) return Pair(out, 0)
+        val pool = Executors.newFixedThreadPool(minOf(8, chunks.size))
+        try {
+            for (chunk in chunks) {
+                pool.execute {
+                    try {
+                        val url = DEXSCREENER + chunk.joinToString(",")
+                        val text = try {
+                            request(url)
+                        } catch (e: HttpError) {
+                            if (e.status != 429) throw e
+                            Thread.sleep(1_000)
+                            request(url)
+                        }
+                        parseDexScreener(JSONArray(text), chunk.map { it.lowercase() }.toSet(), out)
+                    } catch (e: Exception) {
+                        failed.incrementAndGet()
+                    }
+                }
+            }
+        } finally {
+            pool.shutdown()
+            pool.awaitTermination(60, TimeUnit.SECONDS)
+        }
+        return Pair(out, failed.get())
+    }
+
+    private fun parseDexScreener(arr: JSONArray, wanted: Set<String>, out: ConcurrentHashMap<String, PoolPrice>) {
+        for (i in 0 until arr.length()) {
+            val p = arr.optJSONObject(i) ?: continue
+            if (p.optString("chainId") != "base") continue
+            val base = p.optJSONObject("baseToken")?.optString("address")?.lowercase() ?: continue
+            val quote = p.optJSONObject("quoteToken")?.optString("address")?.lowercase() ?: continue
+            val tokenIsBase = base in wanted
+            if (!tokenIsBase && quote !in wanted) continue
+            val token = if (tokenIsBase) base else quote
+            val other = if (tokenIsBase) quote else base
+            if (other != USDC_LC) continue
+            val usd = p.optString("priceUsd").toDoubleOrNull() ?: continue
+            val native = p.optString("priceNative").toDoubleOrNull() ?: continue
+            // priceUsd e priceNative si riferiscono al token base della pool
+            val px = if (tokenIsBase) usd else if (native > 0) usd / native else 0.0
+            if (!(px > 0) || !px.isFinite()) continue
+            val liq = p.optJSONObject("liquidity")?.optDouble("usd", 0.0)?.takeIf { it.isFinite() } ?: 0.0
+            val labels = p.optJSONArray("labels")
+            val labelText = if (labels == null) "" else (0 until labels.length()).joinToString(" ") { labels.optString(it) }
+            val dex = (p.optString("dexId", "?") + " " + labelText).trim()
+            val cand = PoolPrice(px, liq, dex, p.optString("pairAddress").ifEmpty { null })
+            out.merge(token, cand) { a, b -> if (better(b, a)) b else a }
+        }
+    }
+
     // ---------------------------------------------------------------- GeckoTerminal
     /**
-     * Prezzo medio e liquidità del pool principale di ogni token: 1 richiesta ogni 30 token.
-     * Chiave della mappa: indirizzo in minuscolo. I token assenti non hanno pool indicizzati.
+     * Scoperta (lenta, ~25 s): pool più liquida di ogni token e liquidità totale.
+     * Serve solo a trovare i token che DexScreener non indicizza; i blocchi falliti vengono saltati.
      */
-    fun gecko(addresses: List<String>): Map<String, PoolData> {
-        val out = mutableMapOf<String, PoolData>()
+    fun gecko(addresses: List<String>): Map<String, PoolPrice> {
+        val out = mutableMapOf<String, PoolPrice>()
+        val headers = mapOf("Accept" to "application/json;version=20230302")
         for (chunk in addresses.chunked(30)) {
             val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
                 chunk.joinToString(",") + "?include=top_pools"
-            val headers = mapOf("Accept" to "application/json;version=20230302")
             val text = try {
-                request(url, headers = headers)
-            } catch (e: HttpError) {
-                if (e.status != 429) throw e
-                Thread.sleep(2_000)                       // limite di frequenza: un nuovo tentativo
-                request(url, headers = headers)
+                try {
+                    request(url, headers = headers)
+                } catch (e: HttpError) {
+                    if (e.status != 429) throw e
+                    Thread.sleep(3_000)
+                    request(url, headers = headers)
+                }
+            } catch (e: Exception) {
+                continue
             }
-            val o = JSONObject(text)
+            val o = try { JSONObject(text) } catch (e: Exception) { continue }
             val pools = mutableMapOf<String, JSONObject>()
             val inc = o.optJSONArray("included") ?: JSONArray()
             for (i in 0 until inc.length()) {
@@ -170,27 +248,22 @@ object Api {
                 val refs = t.optJSONObject("relationships")?.optJSONObject("top_pools")
                     ?.optJSONArray("data") ?: JSONArray()
                 var reserve = 0.0
-                var bestReserve = -1.0
-                var poolPrice: Double? = null
+                var top: JSONObject? = null
+                var topReserve = -1.0
                 for (j in 0 until refs.length()) {
                     val p = pools[refs.getJSONObject(j).optString("id")] ?: continue
-                    val pa = p.optJSONObject("attributes") ?: continue
-                    val r = pa.optString("reserve_in_usd").toDoubleOrNull() ?: 0.0
+                    val r = p.optJSONObject("attributes")?.optString("reserve_in_usd")?.toDoubleOrNull() ?: 0.0
                     reserve += r
-                    if (r > bestReserve) {
-                        val baseId = p.optJSONObject("relationships")?.optJSONObject("base_token")
-                            ?.optJSONObject("data")?.optString("id")?.lowercase() ?: ""
-                        val px = if (baseId.endsWith(addr)) pa.optString("base_token_price_usd").toDoubleOrNull()
-                        else pa.optString("quote_token_price_usd").toDoubleOrNull()
-                        if (px != null && px > 0) {
-                            bestReserve = r
-                            poolPrice = px
-                        }
+                    if (r > topReserve) {
+                        topReserve = r
+                        top = p
                     }
                 }
-                val tokenPrice = a.optString("price_usd").toDoubleOrNull()?.takeIf { it > 0 }
-                val total = a.optString("total_reserve_in_usd").toDoubleOrNull() ?: 0.0
-                out[addr] = PoolData(poolPrice ?: tokenPrice, maxOf(reserve, total), refs.length() > 0)
+                val price = a.optString("price_usd").toDoubleOrNull()?.takeIf { it > 0 } ?: continue
+                val dexId = top?.optJSONObject("relationships")?.optJSONObject("dex")
+                    ?.optJSONObject("data")?.optString("id") ?: "geckoterminal"
+                val pairAddr = top?.optJSONObject("attributes")?.optString("address")
+                out[addr] = PoolPrice(price, reserve, dexId, pairAddr)
             }
         }
         return out
