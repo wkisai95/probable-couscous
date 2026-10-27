@@ -211,53 +211,46 @@ object Api {
     }
 
     // ---------------------------------------------------------------- GeckoTerminal
-    private const val GECKO_THREADS = 4
+    /** Pausa tra le richieste: GeckoTerminal rifiuta (HTTP 429) le richieste ravvicinate o parallele. */
+    private const val GECKO_GAP_MS = 1_200L
 
     /**
-     * Pool più liquida di ogni token e liquidità totale da GeckoTerminal (richieste parallele
-     * da 30 indirizzi). Completa DexScreener: trova le pool che non indicizza. -> (prezzi, richieste fallite)
+     * Pool più liquida di ogni token e liquidità totale da GeckoTerminal, a blocchi di 30 indirizzi.
+     * Richieste in sequenza con pausa e attese crescenti se il servizio limita la frequenza.
+     * Completa DexScreener: trova le pool che non indicizza. -> (prezzi, richieste fallite)
      */
     fun gecko(addresses: List<String>): Pair<Map<String, PoolPrice>, Int> {
         val out = ConcurrentHashMap<String, PoolPrice>()
-        val failed = AtomicInteger(0)
-        val chunks = addresses.chunked(30)
-        if (chunks.isEmpty()) return Pair(out, 0)
+        var failed = 0
         val headers = mapOf("Accept" to "application/json;version=20230302")
-        val pool = Executors.newFixedThreadPool(minOf(GECKO_THREADS, chunks.size))
-        try {
-            for (chunk in chunks) {
-                pool.execute {
-                    val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
-                        chunk.joinToString(",") + "?include=top_pools"
-                    var text: String? = null
-                    for (attempt in 0..2) {
-                        try {
-                            text = request(url, headers = headers)
-                            break
-                        } catch (e: HttpError) {
-                            if (e.status != 429 || attempt == 2) break
-                            Thread.sleep(1_500L * (attempt + 1))   // limite di frequenza
-                        } catch (e: Exception) {
-                            break
-                        }
-                    }
-                    val body = text
-                    if (body == null) {
-                        failed.incrementAndGet()
-                    } else {
-                        try {
-                            parseGecko(JSONObject(body), out)
-                        } catch (e: Exception) {
-                            failed.incrementAndGet()
-                        }
-                    }
+        for ((i, chunk) in addresses.chunked(30).withIndex()) {
+            if (i > 0) Thread.sleep(GECKO_GAP_MS)
+            val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
+                chunk.joinToString(",") + "?include=top_pools"
+            var body: String? = null
+            for (attempt in 0..3) {
+                try {
+                    body = request(url, headers = headers)
+                    break
+                } catch (e: HttpError) {
+                    if (e.status != 429 || attempt == 3) break
+                    Thread.sleep(2_000L shl attempt)   // 2, 4, 8 s
+                } catch (e: Exception) {
+                    break
                 }
             }
-        } finally {
-            pool.shutdown()
-            pool.awaitTermination(120, TimeUnit.SECONDS)
+            val text = body
+            if (text == null) {
+                failed++
+                continue
+            }
+            try {
+                parseGecko(JSONObject(text), out)
+            } catch (e: Exception) {
+                failed++
+            }
         }
-        return Pair(out, failed.get())
+        return Pair(out, failed)
     }
 
     private fun parseGecko(o: JSONObject, out: ConcurrentHashMap<String, PoolPrice>) {
