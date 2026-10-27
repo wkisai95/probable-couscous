@@ -168,6 +168,34 @@ def feeds_cmd() -> None:
     lines.append(f"GeckoTerminal: {gt_s:.1f} s · 8 richieste in sequenza · 429={gt_429} fallite={gt_fail} · "
                  f"prezzo per {len(gt_price)} token · con liquidità ≥ $1k: {gt_liquid}")
 
+    # GeckoTerminal come nell'app 1.0.10: 4 richieste in parallelo, ripetizione dopo 1,5 s / 3 s su 429
+    from concurrent.futures import ThreadPoolExecutor
+    _t.sleep(5)
+    par = {"429": 0, "fail": 0, "tokens": 0}
+
+    def gt_job(chunk):
+        url = ("https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/"
+               + ",".join(chunk) + "?include=top_pools")
+        for attempt in range(3):
+            r = requests.get(url, headers=hdr, timeout=30)
+            if r.status_code == 429 and attempt < 2:
+                par["429"] += 1
+                _t.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return len(r.json().get("data", []))
+        return 0
+
+    t0 = _t.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for f in [ex.submit(gt_job, addrs[i:i + 30]) for i in range(0, len(addrs), 30)]:
+            try:
+                par["tokens"] += f.result()
+            except Exception:  # noqa: BLE001
+                par["fail"] += 1
+    lines.append(f"GeckoTerminal parallelo (4): {_t.perf_counter() - t0:.1f} s · 429={par['429']} "
+                 f"fallite={par['fail']} · token restituiti {par['tokens']}")
+
     # DexScreener: richieste parallele, blocchi da 30 e da 10
     results = {}
     for chunk in (30, 10):
