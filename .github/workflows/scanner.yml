@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "scan = scansione · tokens = elenco token Coinbase con i pool DEX"
+        description: "scan = scansione · tokens = elenco token con i pool DEX · feeds = confronto feed prezzi"
         type: choice
-        options: [scan, tokens]
+        options: [scan, tokens, feeds]
         default: scan
 
 concurrency:
@@ -58,6 +58,8 @@ jobs:
         run: |
           if [ "$CMD" = "tokens" ]; then
             python -m tokenarb tokens --liquidity
+          elif [ "$CMD" = "feeds" ]; then
+            python -m tokenarb feeds
           else
             python -m tokenarb scan
           fi

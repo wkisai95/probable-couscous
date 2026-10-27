@@ -124,6 +124,107 @@ def list_tokens_cmd(with_liquidity: bool) -> None:
         gh_notice(f"Senza pool ({len(no_pools)})", ", ".join(no_pools))
 
 
+def feeds_cmd() -> None:
+    """Confronta i feed di prezzi on-chain: GeckoTerminal (come l'app 1.0.8) e DexScreener."""
+    import time as _t
+
+    import requests
+
+    from .coinbase import list_tokens
+    from .dexscreener import API as DS_API, fetch_pools, best_usdc_pool, parse_pairs
+
+    toks = list_tokens()
+    addrs = [t.address for t in toks]
+    sym = {t.address.lower(): t.symbol for t in toks}
+    lines: list[str] = [f"{len(toks)} token Coinbase su Base"]
+
+    # GeckoTerminal: 8 richieste in sequenza, una ripetizione dopo 2 s in caso di 429
+    gt_price: dict[str, tuple[float, float]] = {}
+    gt_fail = gt_429 = 0
+    t0 = _t.perf_counter()
+    hdr = {"Accept": "application/json;version=20230302", "User-Agent": "tokenarb-scanner/1.0"}
+    for i in range(0, len(addrs), 30):
+        url = ("https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/"
+               + ",".join(addrs[i:i + 30]) + "?include=top_pools")
+        try:
+            r = requests.get(url, headers=hdr, timeout=30)
+            if r.status_code == 429:
+                gt_429 += 1
+                _t.sleep(2)
+                r = requests.get(url, headers=hdr, timeout=30)
+            r.raise_for_status()
+            d = r.json()
+            for tok in d.get("data", []):
+                a = tok.get("attributes", {})
+                px = float(a.get("price_usd") or 0)
+                res = float(a.get("total_reserve_in_usd") or 0)
+                if px > 0:
+                    gt_price[a.get("address", "").lower()] = (px, res)
+        except Exception as e:  # noqa: BLE001
+            gt_fail += 1
+            log.warning("GeckoTerminal: %s", e)
+    gt_s = _t.perf_counter() - t0
+    gt_liquid = sum(1 for _, (p, r) in gt_price.items() if r >= 1000)
+    lines.append(f"GeckoTerminal: {gt_s:.1f} s · 8 richieste in sequenza · 429={gt_429} fallite={gt_fail} · "
+                 f"prezzo per {len(gt_price)} token · con liquidità ≥ $1k: {gt_liquid}")
+
+    # DexScreener: richieste parallele, blocchi da 30 e da 10
+    results = {}
+    for chunk in (30, 10):
+        by_tok, st = fetch_pools(addrs, chunk=chunk, workers=8)
+        best = {a: best_usdc_pool(p) for a, p in by_tok.items()}
+        best = {a: b for a, b in best.items() if b}
+        aero = {a: b for a, b in best.items() if b.is_aero}
+        liquid = {a: b for a, b in best.items() if b.liquidity_usd >= 1000}
+        with_pairs = sum(1 for p in by_tok.values() if p)
+        results[chunk] = (by_tok, best, liquid)
+        lines.append(
+            f"DexScreener blocchi da {chunk}: {st.seconds:.1f} s · {st.requests} richieste parallele "
+            f"(fallite {st.failed}) · {st.pairs} pool · token con pool {with_pairs} · "
+            f"con pool USDC {len(best)} (Aero {len(aero)}) · con liquidità ≥ $1k: {len(liquid)}")
+        lines.append("  dexId: " + ", ".join(f"{k}={v}" for k, v in sorted(st.dex_ids.items(), key=lambda x: -x[1])))
+
+    # verifica di troncamento: per i token senza pool col blocco da 30, chiedo le pool una per una
+    by30 = results[30][0]
+    missing = [a for a in addrs if not by30.get(a.lower())][:40]
+    found_single = []
+    s = requests.Session()
+    t0 = _t.perf_counter()
+    for a in missing:
+        try:
+            r = s.get(f"{DS_API}/token-pairs/v1/base/{a}", headers={"Accept": "application/json"}, timeout=20)
+            if r.status_code == 200:
+                pools = parse_pairs(r.json() if isinstance(r.json(), list) else [], [a])
+                b = best_usdc_pool(pools)
+                if b:
+                    found_single.append(f"{sym[a.lower()]} {b.dex} liq=${b.liquidity_usd:,.0f}")
+        except Exception:  # noqa: BLE001
+            pass
+    lines.append(f"Controllo singolo di {len(missing)} token senza pool nel blocco da 30 "
+                 f"({_t.perf_counter() - t0:.1f} s): {len(found_single)} hanno in realtà una pool USDC"
+                 + (": " + "; ".join(found_single[:15]) if found_single else ""))
+
+    # coerenza dei prezzi tra le due fonti sui token liquidi
+    liquid30 = results[30][2]
+    diffs = []
+    for a, b in sorted(liquid30.items(), key=lambda x: -x[1].liquidity_usd):
+        g = gt_price.get(a)
+        if g:
+            diffs.append(f"{sym[a]:<8} DS {b.price_usd:>10.2f}  GT {g[0]:>10.2f}  "
+                         f"Δ {(b.price_usd - g[0]) / g[0] * 1e4:+6.0f} bps  {b.dex:<16} liq ${b.liquidity_usd:,.0f}")
+        else:
+            diffs.append(f"{sym[a]:<8} DS {b.price_usd:>10.2f}  GT       n/d   {b.dex:<16} liq ${b.liquidity_usd:,.0f}")
+    only_ds = [sym[a] for a in liquid30 if a not in gt_price or gt_price[a][1] < 1000]
+    only_gt = [sym[a] for a, (p, r) in gt_price.items() if r >= 1000 and a not in liquid30]
+    lines.append(f"Liquidi solo su DexScreener ({len(only_ds)}): {', '.join(only_ds)}")
+    lines.append(f"Liquidi solo su GeckoTerminal ({len(only_gt)}): {', '.join(only_gt)}")
+    print("\n".join(lines))
+    print("\n".join(diffs))
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        gh_notice("Confronto feed", "\n".join(lines))
+        gh_notice("Prezzi DexScreener vs GeckoTerminal", "\n".join(diffs))
+
+
 def run_once(cfg: dict, notify: bool) -> None:
     collect = _Collect()
     logging.getLogger().addHandler(collect)
@@ -145,7 +246,7 @@ def run_once(cfg: dict, notify: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="tokenarb")
-    p.add_argument("command", choices=["scan", "run", "tokens", "test-notify"])
+    p.add_argument("command", choices=["scan", "run", "tokens", "feeds", "test-notify"])
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--no-notify", action="store_true")
     p.add_argument("--liquidity", action="store_true",
@@ -165,6 +266,9 @@ def main() -> None:
         return
     if a.command == "tokens":
         list_tokens_cmd(with_liquidity=a.liquidity)
+        return
+    if a.command == "feeds":
+        feeds_cmd()
         return
 
     interval = int(cfg.get("interval_minutes", 15)) * 60
