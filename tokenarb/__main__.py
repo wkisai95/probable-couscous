@@ -42,6 +42,20 @@ def _gh_escape(s: str) -> str:
     return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def gh_notice(title: str, text: str, level: str = "notice", limit: int = 3800) -> None:
+    """Annotazione GitHub; i testi lunghi vengono divisi in più blocchi (GitHub tronca a ~4 KB)."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur}\n{line}" if cur else line
+    chunks.append(cur)
+    for i, c in enumerate(chunks):
+        t = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
+        print(f"::{level} title={t}::{_gh_escape(c)}")
+
+
 def github_summary(opps, records) -> None:
     """Su GitHub Actions: annotazioni (visibili nella pagina della run) e step summary."""
     rows = sorted(opps, key=lambda x: -(x.best.net_profit_usd if x.best else -1e9))
@@ -56,9 +70,9 @@ def github_summary(opps, records) -> None:
     warns = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
     head = "\n".join(m for m in info if "token" in m.lower() or "opportunità" in m
                      or m.startswith("Senza"))
-    print(f"::notice title=Scansione::{_gh_escape(head + chr(10) + chr(10).join(lines))}")
+    gh_notice("Scansione", head + "\n" + "\n".join(lines))
     if warns:
-        print(f"::warning title=Avvisi ({len(warns)})::{_gh_escape(chr(10).join(warns[:80]))}")
+        gh_notice(f"Avvisi ({len(warns)})", "\n".join(warns[:80]), level="warning")
     summary = os.getenv("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
@@ -105,8 +119,8 @@ def list_tokens_cmd(with_liquidity: bool) -> None:
             rows.append(f"{t.symbol:<9} liq=${i.total_usd:>12,.0f}  pool={len(i.pools)}  "
                         f"top={top.dex} {top.name} vol24h=${top.volume_24h_usd:,.0f}")
         no_pools = [t.symbol for t in toks if t not in with_pools]
-        print(f"::notice title=Liquidità token::{_gh_escape(head + chr(10) + chr(10).join(rows))}")
-        print(f"::notice title=Senza pool ({len(no_pools)})::{_gh_escape(', '.join(no_pools))}")
+        gh_notice("Liquidità token", head + "\n" + "\n".join(rows))
+        gh_notice(f"Senza pool ({len(no_pools)})", ", ".join(no_pools))
 
 
 def run_once(cfg: dict, notify: bool) -> None:
