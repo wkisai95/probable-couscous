@@ -16,6 +16,13 @@ from .models import DexQuote
 
 log = logging.getLogger(__name__)
 
+# 4008 route not found · 4010 nessun pool idoneo · 4011 token non indicizzato
+NO_ROUTE_CODES = {4008, 4010, 4011}
+
+
+class NoRouteError(RuntimeError):
+    """L'aggregatore non trova liquidità per la coppia."""
+
 
 class KyberSwap:
     def __init__(self, cfg: dict):
@@ -35,10 +42,17 @@ class KyberSwap:
         r = self.s.get(self.url, params={"tokenIn": token_in, "tokenOut": token_out,
                                          "amountIn": str(raw_in)}, timeout=20)
         self._last = time.time()
-        r.raise_for_status()
-        body = r.json()
-        if body.get("code") not in (0, None) or "data" not in body:
-            raise RuntimeError(f"KyberSwap: {body.get('message')}")
+        try:
+            body = r.json()
+        except ValueError:
+            r.raise_for_status()
+            raise
+        code = body.get("code")
+        if r.status_code != 200 or code not in (0, None) or "data" not in body:
+            msg = f"KyberSwap {code}: {body.get('message')}"
+            if code in NO_ROUTE_CODES:
+                raise NoRouteError(msg)
+            raise RuntimeError(f"{msg} (HTTP {r.status_code})")
         rs = body["data"]["routeSummary"]
         out = float(Decimal(rs["amountOut"]) / (Decimal(10) ** dec_out))
         gas = float(rs.get("gasUsd") or 0) + float(rs.get("l1FeeUsd") or 0)

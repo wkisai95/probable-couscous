@@ -97,6 +97,17 @@ def optimal(direction: str, fair: float, quote_fn: QuoteFn, cm: CostModel,
     return best
 
 
+def unit_edge(direction: str, buy_px: float, sell_px: float, fair: float,
+              cm: CostModel) -> float:
+    """Margine per token a size minima, al netto dei costi della copertura (gas escluso)."""
+    hs = cm.stock_half_spread_bps / 1e4
+    if direction == BUY_TOKEN:
+        stock_px = fair * (1 - hs)
+        return stock_px * (1 - cm.stock_fee_bps / 1e4) - cm.multiplier * cm.stock_fee_per_share - buy_px
+    stock_px = fair * (1 + hs)
+    return sell_px - stock_px * (1 + cm.stock_fee_bps / 1e4) - cm.multiplier * cm.stock_fee_per_share
+
+
 def direction_for(buy_px: float, sell_px: float, fair: float) -> Optional[str]:
     """Prezzi on-chain per piccola size vs prezzo Borsa per token."""
     if buy_px < fair:

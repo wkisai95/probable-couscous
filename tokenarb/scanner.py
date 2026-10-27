@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import sizing
 from .coinbase import list_tokens
-from .dex import KyberSwap
+from .dex import KyberSwap, NoRouteError
 from .market_hours import DEFAULT_HOLIDAYS, session_at
 from .models import CbToken, Opportunity, RefQuote
 from .reference import fetch_chainlink, fetch_wallstreet
@@ -97,11 +97,13 @@ def scan(cfg: dict,
     cl_refs = chainlink_fn(feeds, cfg["base"]["rpc_url"])
 
     opps: List[Opportunity] = []
+    no_ref: List[str] = []
+    no_route: List[str] = []
     for t in tokens:
         ws, cl = ws_refs.get(t.ticker), cl_refs.get(t.ticker)
         fair_info = pick_fair(t, ws, cl, now, max_age)
         if not fair_info:
-            log.warning("%s: nessun prezzo di riferimento", t.symbol)
+            no_ref.append(t.symbol)
             continue
         fair, src, age = fair_info
         qfn = make_quote_fn(dex, t, usdc)
@@ -111,14 +113,21 @@ def scan(cfg: dict,
             buy_px = probe / qb.amount_out
             qs = qfn(sizing.SELL_TOKEN, probe / fair)
             sell_px = qs.amount_out / (probe / fair)
+        except NoRouteError:
+            no_route.append(t.symbol)
+            continue
         except Exception as e:  # noqa: BLE001
-            log.warning("%s: nessuna liquidità on-chain (%s)", t.symbol, e)
+            log.warning("%s: quota on-chain non disponibile (%s)", t.symbol, e)
             continue
 
         mid = (buy_px + sell_px) / 2
         gap = (mid - fair) / fair * 1e4
         cm = cost_model(cfg, session, t.multiplier)
         direction = sizing.direction_for(buy_px, sell_px, fair)
+        # margine per token già alla size minima: se non copre i costi della
+        # copertura nessuna size è profittevole (il margine cala con la size)
+        if direction and sizing.unit_edge(direction, buy_px, sell_px, fair, cm) <= 0:
+            direction = None
         best = fixed = None
         if direction:
             best = sizing.optimal(direction, fair, qfn, cm,
@@ -150,6 +159,10 @@ def scan(cfg: dict,
             chainlink_price=cl.price if cl else None,
             best=best, fixed=fixed, actionable=actionable, notes=notes,
         ))
+    if no_ref:
+        log.warning("Senza prezzo di riferimento (%d): %s", len(no_ref), ", ".join(no_ref))
+    if no_route:
+        log.info("Senza liquidità instradabile on-chain (%d): %s", len(no_route), ", ".join(no_route))
     return opps
 
 

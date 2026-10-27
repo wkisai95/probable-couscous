@@ -169,3 +169,34 @@ def test_closed_market_not_actionable(monkeypatch):
 ])
 def test_sessions(utc, expected):
     assert session_at(datetime.fromisoformat(utc).replace(tzinfo=timezone.utc)) == expected
+
+
+def test_unit_edge_blocks_unprofitable_sizes():
+    cm = sizing.CostModel(stock_fee_per_share=0.005, stock_half_spread_bps=2)
+    # token appena sotto il prezzo: il margine non copre spread e commissioni
+    assert sizing.unit_edge(sizing.BUY_TOKEN, 199.99, 199.0, 200, cm) < 0
+    assert sizing.unit_edge(sizing.BUY_TOKEN, 198.0, 197.0, 200, cm) > 0
+    assert sizing.unit_edge(sizing.SELL_TOKEN, 203.0, 202.0, 200, cm) > 0
+
+
+def test_tokens_without_route_are_skipped(monkeypatch, caplog):
+    from tokenarb.dex import NoRouteError
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    class NoRoute:
+        def quote(self, *a):
+            raise NoRouteError("KyberSwap 4008: route not found")
+
+    monkeypatch.setattr(scanner, "datetime", Frozen)
+    tok = CbToken("0xb2", "ABNBc", "ABNB", "Airbnb", 18, 1.0)
+    with caplog.at_level("INFO"):
+        opps = scanner.scan(
+            _cfg(), tokens_fn=lambda: [tok],
+            wallstreet_fn=lambda s, src: {"ABNB": RefQuote("ABNB", 130.0, NOW, "yahoo")},
+            chainlink_fn=lambda f, r: {}, dex=NoRoute())
+    assert opps == []
+    assert "Senza liquidità instradabile on-chain (1): ABNBc" in caplog.text
