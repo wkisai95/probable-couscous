@@ -140,7 +140,7 @@ object Scanner {
                 }
             }
         }
-        val active = liquid + unknown.filter { it.address.lowercase() in probes }
+        val active = liquid + unknown.filter { probes.containsKey(it.address.lowercase()) }
 
         // 4. prezzi di Borsa per i soli token con liquidità
         onUpdate(outcome(true, "Prezzi Wall Street (${active.size} titoli)…"))
