@@ -1,0 +1,55 @@
+# Configurazione dello scanner tokenarb
+
+interval_minutes: 15          # frequenza del loop locale (`python -m tokenarb run`)
+reference_source: yahoo       # yahoo (gratuito, include pre/after-market) | finnhub (FINNHUB_API_KEY)
+
+# Ticker azionari da confrontare con la versione tokenizzata (xStocks)
+tickers: [AAPL, TSLA, NVDA, MSFT, AMZN, GOOGL, META, COIN, MSTR, HOOD, CRCL, SPY, QQQ]
+
+# Azioni rappresentate da 1 token (default 1.0). Modificare se un token
+# accumula dividendi o ha un rapporto diverso.
+shares_per_token: {}
+#  AAPL: 1.0
+
+# Sessioni in cui l'arbitraggio è considerato eseguibile (si può coprire in Borsa)
+tradable_sessions: [regular]  # aggiungere pre / post se il broker lo consente
+
+venues:
+  kraken:
+    enabled: true
+    symbol_format: "{ticker}xUSD"   # es. AAPLxUSD
+    symbol_overrides: {}
+    taker_fee_bps: 26               # verificare il proprio livello commissionale
+    fixed_cost_usd: 0
+    depth: 100
+  bybit:
+    enabled: true                   # Bybit blocca IP USA: disattivare se gira su GitHub Actions
+    symbol_format: "{ticker}XUSDT"  # es. AAPLXUSDT (prezzi convertiti USDT -> USD)
+    symbol_overrides: {}
+    taker_fee_bps: 10
+    fixed_cost_usd: 0
+    depth: 200
+
+stock_costs:                  # lato broker azioni
+  fee_bps: 0
+  fee_per_share: 0.005        # es. IBKR Pro fixed
+  fixed_cost_usd: 0
+  half_spread_bps_regular: 2
+  half_spread_bps_extended: 15
+
+thresholds:
+  min_net_profit_usd: 20      # profitto netto minimo per notificare
+  min_net_bps: 30             # rendimento netto minimo (bps sul controvalore)
+  max_notional_usd: 25000     # capitale massimo per singola operazione
+  trade_size_usd: 1000        # size fissa di confronto mostrata nelle notifiche
+  max_ref_age_minutes: 20     # oltre, il prezzo Borsa è considerato vecchio
+
+notifications:
+  cooldown_minutes: 60        # non ripetere lo stesso alert prima di...
+  rearm_if_gap_widens_bps: 25 # ...a meno che il gap si allarghi di almeno X bps
+
+output:
+  csv: data/scans.csv
+  state: state/alerts.json
+
+holidays: []                  # date extra di chiusura NYSE (YYYY-MM-DD)
