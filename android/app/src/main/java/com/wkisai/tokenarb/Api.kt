@@ -8,8 +8,14 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
+class HttpError(val status: Int, val body: String) : RuntimeException("HTTP $status: ${body.take(160)}")
+
+/** L'aggregatore non trova liquidità per il token (KyberSwap 4008/4010/4011). */
+class NoRouteException(msg: String) : RuntimeException(msg)
+
 /** Chiamate HTTP alle fonti dati (Coinbase, Yahoo, Chainlink via RPC, KyberSwap). */
 object Api {
+    private val NO_ROUTE_CODES = setOf(4008, 4010, 4011)
     private const val UA = "Mozilla/5.0 (Android) TokenArb/1.0"
     const val USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
     const val USDC_DECIMALS = 6
@@ -37,7 +43,7 @@ object Api {
             val code = c.responseCode
             val stream = if (code in 200..299) c.inputStream else c.errorStream
             val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            if (code !in 200..299) throw RuntimeException("HTTP $code: ${text.take(160)}")
+            if (code !in 200..299) throw HttpError(code, text)
             return text
         } finally {
             c.disconnect()
@@ -141,8 +147,18 @@ object Api {
         val raw = BigDecimal.valueOf(amountIn).movePointRight(decIn).toBigInteger()
         val url = "$KYBER?tokenIn=$tokenIn&tokenOut=$tokenOut&amountIn=$raw"
         try {
-            val body = JSONObject(request(url, headers = mapOf("X-Client-Id" to "tokenarb-android")))
+            val text = try {
+                request(url, headers = mapOf("X-Client-Id" to "tokenarb-android"))
+            } catch (e: HttpError) {
+                val err = try { JSONObject(e.body) } catch (x: Exception) { null }
+                val code = err?.optInt("code", -1) ?: -1
+                if (code in NO_ROUTE_CODES) throw NoRouteException("KyberSwap $code: ${err?.optString("message")}")
+                throw RuntimeException("KyberSwap HTTP ${e.status}: ${err?.optString("message") ?: e.body.take(120)}")
+            }
+            val body = JSONObject(text)
             if (body.optInt("code", 0) != 0 || !body.has("data")) {
+                val code = body.optInt("code", -1)
+                if (code in NO_ROUTE_CODES) throw NoRouteException("KyberSwap $code")
                 throw RuntimeException("KyberSwap: ${body.optString("message")}")
             }
             val rs = body.getJSONObject("data").getJSONObject("routeSummary")
