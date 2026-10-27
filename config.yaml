@@ -15,6 +15,10 @@ yahoo_symbols: {}
 # Sessioni in cui è possibile coprirsi in Borsa (aggiungere pre/post se il broker lo consente)
 tradable_sessions: [regular]
 
+# Solo arbitraggi in cui conviene comprare il token (costa meno che in Borsa).
+# false = anche il lato opposto (vendere token + comprare azione).
+only_buy_token: true
+
 base:
   rpc_url: https://mainnet.base.org
   usdc:

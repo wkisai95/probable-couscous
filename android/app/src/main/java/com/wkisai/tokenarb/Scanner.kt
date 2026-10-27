@@ -175,11 +175,15 @@ object Scanner {
                 pr?.first, pr?.second, pool?.priceUsd, pool?.reserveUsd, gap, c?.price,
                 null, null, false, baseNotes(t, session, tradable, age, s, w, c, started),
             )
-            if (abs(gap) >= prefilter) {
+            // con "solo acquisto" interessano solo i token più economici che in Borsa
+            val relevant = if (s.buyOnly) gap <= -prefilter else abs(gap) >= prefilter
+            if (relevant) {
                 candidates += Candidate(t, fairPx, gap, pr, base)
                 opps[a] = base
             } else {
-                opps[a] = base.copy(notes = base.notes + "gap sotto ${prefilter.toInt()} bps: size non calcolata")
+                val why = if (s.buyOnly && gap > -prefilter) "sconto inferiore a ${prefilter.toInt()} bps"
+                else "gap sotto ${prefilter.toInt()} bps"
+                opps[a] = base.copy(notes = base.notes + "$why: size non calcolata")
             }
         }
         if (noRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${noRef.joinToString(", ")}"
@@ -235,6 +239,10 @@ object Scanner {
         }
         if (probe == null) return c.base.copy(notes = c.base.notes + "prezzi on-chain allineati alla Borsa")
         val (dir, buyPx, sellPx) = probe
+        if (s.buyOnly && dir != Sizing.BUY) {
+            return c.base.copy(dexBuy = buyPx, dexSell = sellPx,
+                notes = c.base.notes + "token più caro che in Borsa: non conviene comprarlo")
+        }
         val edge = Sizing.unitEdge(dir, buyPx ?: Double.MAX_VALUE, sellPx ?: 0.0, fair, costs)
         if (edge <= 0) {
             return c.base.copy(dexBuy = buyPx, dexSell = sellPx,

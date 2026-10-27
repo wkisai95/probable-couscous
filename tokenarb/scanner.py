@@ -124,6 +124,8 @@ def scan(cfg: dict,
         gap = (mid - fair) / fair * 1e4
         cm = cost_model(cfg, session, t.multiplier)
         direction = sizing.direction_for(buy_px, sell_px, fair)
+        if cfg.get("only_buy_token", True) and direction == sizing.SELL_TOKEN:
+            direction = None  # interessa solo comprare il token quando costa meno che in Borsa
         # margine per token già alla size minima: se non copre i costi della
         # copertura nessuna size è profittevole (il margine cala con la size)
         if direction and sizing.unit_edge(direction, buy_px, sell_px, fair, cm) <= 0:

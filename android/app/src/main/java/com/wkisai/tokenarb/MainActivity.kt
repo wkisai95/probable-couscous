@@ -146,16 +146,36 @@ class MainActivity : Activity() {
             return
         }
         val time = SimpleDateFormat("dd/MM HH:mm", Locale.ITALY).format(Date(out.timeMillis))
-        val actionable = out.opportunities.count { it.actionable }
-        val sized = out.opportunities.count { it.best != null }
+        val buyOnly = Store.loadSettings(this).buyOnly
+        // con "solo acquisto": solo i token che conviene comprare (sotto la Borsa, netto positivo)
+        val shown = if (buyOnly) out.opportunities.filter {
+            val b = it.best
+            b != null && b.direction == Sizing.BUY && b.netUsd > 0
+        } else out.opportunities
+        val actionable = shown.count { it.actionable }
         status.text = buildString {
             when {
                 out.inProgress && running -> append("⏳ ${out.progress} · ${out.durationSec} s\n")
                 out.inProgress -> append("Scansione interrotta: risultati parziali delle $time\n")
                 else -> append("Ultima scansione: $time (${out.durationSec} s) · Borsa ${Market.label(out.session)}\n")
             }
-            append("${out.tokensFound} token Coinbase · ${out.opportunities.size} con liquidità · ")
-            append("$sized con size · $actionable sopra soglia")
+            if (buyOnly) {
+                append("${out.tokensFound} token Coinbase · ${out.opportunities.size} con liquidità · ")
+                append("${shown.size} da comprare con profitto · $actionable sopra soglia")
+                if (shown.isEmpty() && !out.inProgress) {
+                    val closest = out.opportunities.minByOrNull { it.gapBps }
+                    append("\nNessun token conviene comprarlo adesso.")
+                    if (closest != null && closest.gapBps < 0) {
+                        append(" Il più scontato è ${closest.symbol} (${signed(closest.gapBps)} bps), ma non copre i costi.")
+                    } else {
+                        append(" Tutti i token costano quanto o più che in Borsa.")
+                    }
+                }
+            } else {
+                val sized = out.opportunities.count { it.best != null }
+                append("${out.tokensFound} token Coinbase · ${out.opportunities.size} con liquidità · ")
+                append("$sized con size · $actionable sopra soglia")
+            }
             if (out.errors.isNotEmpty()) append("\nℹ️ ${out.errors.size} note (tocca qui per i dettagli)")
         }
         status.setOnClickListener {
@@ -164,7 +184,7 @@ class MainActivity : Activity() {
                     .setMessage(out.errors.joinToString("\n\n")).setPositiveButton("OK", null).show()
             }
         }
-        for (o in out.opportunities) list.addView(card(o))
+        for (o in shown) list.addView(card(o))
     }
 
     private fun card(o: Opportunity): View {
@@ -204,7 +224,12 @@ class MainActivity : Activity() {
             textSize = 13f
             setTextColor(Color.DKGRAY)
             text = buildString {
-                append("Gap ${signed(o.gapBps)} bps · Borsa ${Notifier.px(o.fairPrice)} · ")
+                if (b != null && b.direction == Sizing.BUY && o.gapBps < 0) {
+                    append("Sconto ${(-o.gapBps).toInt()} bps sulla Borsa · ")
+                } else {
+                    append("Gap ${signed(o.gapBps)} bps · ")
+                }
+                append("Borsa ${Notifier.px(o.fairPrice)} · ")
                 append(Notifier.dexText(o))
                 if (b != null) append("\n${Notifier.directionLabel(b.direction)} · size ${Notifier.usd0(b.notionalUsd)} (${b.netBps.toInt()} bps)")
             }

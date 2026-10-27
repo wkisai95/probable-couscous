@@ -20,6 +20,8 @@ Scanner **on-chain su Base** che confronta i **tokenized stocks emessi da Coinba
 4. **Direzione:**
    - token sotto il prezzo di Borsa → **compra il token con USDC su Base + short dell'azione**;
    - token sopra → **vendi il token per USDC + compra l'azione**.
+
+   Per impostazione predefinita sono considerati **solo gli arbitraggi in cui conviene comprare il token** (`only_buy_token: true` in `config.yaml`, interruttore nelle impostazioni dell'app).
 5. **Size del profitto.** Su un AMM il prezzo medio peggiora con la size: il profitto netto sale, tocca un massimo e poi scende. Lo scanner chiede quote reali su una scala di size (250 $ → 50.000 $), si ferma quando il profitto cala e raffina attorno al massimo.
 
    ```
@@ -80,6 +82,7 @@ Lo storico di ogni scansione finisce in `data/scans.csv`.
 La cartella `android/` contiene un'app nativa che fa le stesse scansioni direttamente dal telefono:
 - scansiona ogni 15 minuti in background, con notifiche locali e senza server;
 - mostra la lista dei token con gap, direzione, size ottimale e profitto netto (tocca una riga per i dettagli, tieni premuto per aprirla su BaseScan);
+- di base mostra solo i token che conviene comprare (sotto il prezzo di Borsa, con profitto netto positivo); dalle impostazioni si può tornare alla vista completa;
 - si regola dalle impostazioni nell'app: capitale, soglie, commissioni del broker, copertura in pre/after-market.
 
 **Installazione**

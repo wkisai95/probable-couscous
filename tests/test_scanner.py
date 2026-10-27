@@ -200,3 +200,25 @@ def test_tokens_without_route_are_skipped(monkeypatch, caplog):
             chainlink_fn=lambda f, r: {}, dex=NoRoute())
     assert opps == []
     assert "Senza liquidità instradabile on-chain (1): ABNBc" in caplog.text
+
+
+def test_only_buy_token_skips_sell_side(monkeypatch):
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    monkeypatch.setattr(scanner, "datetime", Frozen)
+    tok = CbToken("0xb2", "NFLXc", "NFLX", "Netflix", 18, 1.0)
+    # pool a 210 $/token, Borsa a 200: il token costa di più -> lato vendita
+    amm = FakeAMM(1000, 210_000)
+    cfg = _cfg()
+    opps = scanner.scan(cfg, tokens_fn=lambda: [tok],
+                        wallstreet_fn=lambda s, src: {"NFLX": RefQuote("NFLX", 200.0, NOW, "yahoo")},
+                        chainlink_fn=lambda f, r: {}, dex=amm)
+    assert opps[0].best is None and not opps[0].actionable
+    cfg["only_buy_token"] = False
+    opps = scanner.scan(cfg, tokens_fn=lambda: [tok],
+                        wallstreet_fn=lambda s, src: {"NFLX": RefQuote("NFLX", 200.0, NOW, "yahoo")},
+                        chainlink_fn=lambda f, r: {}, dex=FakeAMM(1000, 210_000))
+    assert opps[0].best is not None and opps[0].best.direction == sizing.SELL_TOKEN

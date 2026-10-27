@@ -19,6 +19,7 @@ data class Settings(
     val cooldownMin: Double = 60.0,
     val extendedTradable: Boolean = false,
     val notifications: Boolean = true,
+    val buyOnly: Boolean = true,       // solo arbitraggi in cui conviene comprare il token
     val tickers: String = "",          // vuoto = tutti
     val exclude: String = "",
 ) {
@@ -54,6 +55,7 @@ object Store {
             cooldownMin = p.d("cooldownMin", d.cooldownMin),
             extendedTradable = p.getBoolean("extendedTradable", d.extendedTradable),
             notifications = p.getBoolean("notifications", d.notifications),
+            buyOnly = p.getBoolean("buyOnly", d.buyOnly),
             tickers = p.getString("tickers", d.tickers) ?: "",
             exclude = p.getString("exclude", d.exclude) ?: "",
         )

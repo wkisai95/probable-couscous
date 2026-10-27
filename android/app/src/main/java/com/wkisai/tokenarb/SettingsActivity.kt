@@ -17,6 +17,7 @@ class SettingsActivity : Activity() {
     private val edits = mutableMapOf<String, EditText>()
     private lateinit var extended: Switch
     private lateinit var notif: Switch
+    private lateinit var buyOnly: Switch
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -64,6 +65,12 @@ class SettingsActivity : Activity() {
             isChecked = s.notifications
             setPadding(0, dp(14), 0, 0)
         }
+        buyOnly = Switch(this).apply {
+            text = "Solo arbitraggi in cui conviene comprare il token"
+            isChecked = s.buyOnly
+            setPadding(0, dp(14), 0, 0)
+        }
+        root.addView(buyOnly)
         root.addView(extended)
         root.addView(notif)
         root.addView(Button(this).apply {
@@ -78,6 +85,7 @@ class SettingsActivity : Activity() {
         edits.forEach { (k, e) -> ed.putString(k, e.text.toString().trim()) }
         ed.putBoolean("extendedTradable", extended.isChecked)
         ed.putBoolean("notifications", notif.isChecked)
+        ed.putBoolean("buyOnly", buyOnly.isChecked)
         ed.apply()
         Toast.makeText(this, "Impostazioni salvate", Toast.LENGTH_SHORT).show()
         finish()
