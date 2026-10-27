@@ -79,7 +79,19 @@ Lo storico di ogni scansione finisce in `data/scans.csv`.
 
 La cartella `android/` contiene un'app nativa che fa le stesse scansioni direttamente dal telefono:
 - scansiona ogni 15 minuti in background, con notifiche locali e senza server;
-- mostra la lista dei token con gap, direzione, size ottimale e profitto netto;
-- si regola dalle impostazioni nell'app: capitale, soglie e commissioni.
+- mostra la lista dei token con gap, direzione, size ottimale e profitto netto (tocca una riga per i dettagli, tieni premuto per aprirla su BaseScan);
+- si regola dalle impostazioni nell'app: capitale, soglie, commissioni del broker, copertura in pre/after-market.
 
-L'APK viene compilato da GitHub Actions (`.github/workflows/android.yml`) a ogni modifica e pubblicato nelle [Release](../../releases/latest).
+**Installazione**
+1. Scarica `TokenArb.apk` dall'ultima [Release](../../releases/latest) direttamente dal telefono.
+2. Aprilo e consenti l'installazione da questa fonte quando Android lo chiede.
+3. Al primo avvio consenti le notifiche e tocca **Consenti scansioni in background**: senza l'esenzione dal risparmio batteria Android può ritardare le scansioni.
+
+L'APK viene compilato da GitHub Actions (`.github/workflows/android.yml`) a ogni modifica e pubblicato nelle Release. Gli aggiornamenti si installano sopra la versione precedente.
+
+## Copertura dei dati (verificata il 27/10/2026)
+
+- **218 token** emessi da Coinbase su Base, **81** con almeno un pool DEX.
+- La liquidità reale sta quasi tutta su **Aero** (`aero-slipstream-base`), poi Uniswap v4 e Aerodrome.
+- KyberSwap instrada tutti i token con liquidità reale; i 19 pool che non instrada hanno liquidità zero.
+- Per l'elenco aggiornato con i pool di ogni token: `python -m tokenarb tokens --liquidity`, oppure *Actions → scanner → Run workflow → tokens*.
