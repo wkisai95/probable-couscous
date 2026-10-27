@@ -33,6 +33,14 @@ jobs:
           key: tokenarb-state-${{ github.run_id }}
           restore-keys: tokenarb-state-
 
+      # Mantiene viva la chiave di firma dell'app Android (cache usata da android.yml):
+      # GitHub elimina le cache non lette per 7 giorni.
+      - name: Keep Android signing key cache alive
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
       - name: Scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

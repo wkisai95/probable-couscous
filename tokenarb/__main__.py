@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,16 +27,62 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
+class _Collect(logging.Handler):
+    """Raccoglie i messaggi di log per il riepilogo su GitHub Actions."""
+
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _gh_escape(s: str) -> str:
+    return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def github_summary(opps, records) -> None:
+    """Su GitHub Actions: annotazioni (visibili nella pagina della run) e step summary."""
+    rows = sorted(opps, key=lambda x: -(x.best.net_profit_usd if x.best else -1e9))
+    lines = [f"{'TOKEN':<8}{'BORSA':>9}{'BUY':>9}{'SELL':>9}{'GAP':>7}{'SIZE$':>8}{'NETTO$':>9}  NOTE"]
+    for o in rows:
+        b = o.best
+        lines.append(
+            f"{o.symbol:<8}{o.fair_price:>9.2f}{o.dex_buy_price:>9.2f}{o.dex_sell_price:>9.2f}"
+            f"{o.gap_bps:>+7.0f}{(b.notional_usd if b else 0):>8.0f}{(b.net_profit_usd if b else 0):>9.2f}"
+            f"  {'OK ' if o.actionable else ''}{(b.direction if b else '-')} {'; '.join(o.notes)[:80]}")
+    info = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    warns = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+    head = "\n".join(m for m in info if "token" in m.lower() or "opportunità" in m)
+    print(f"::notice title=Scansione::{_gh_escape(head + chr(10) + chr(10).join(lines))}")
+    if warns:
+        print(f"::warning title=Avvisi ({len(warns)})::{_gh_escape(chr(10).join(warns[:80]))}")
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### Scansione tokenarb\n\n{head}\n\n```\n" + "\n".join(lines) + "\n```\n")
+            if warns:
+                fh.write("\n<details><summary>Avvisi</summary>\n\n```\n" + "\n".join(warns) + "\n```\n</details>\n")
+
+
 def run_once(cfg: dict, notify: bool) -> None:
-    opps = scan(cfg)
-    print_table(opps)
-    out = cfg.get("output", {})
-    append_csv(opps, Path(out.get("csv", "data/scans.csv")))
-    actionable = [o for o in opps if o.actionable]
-    log.info("%d coppie analizzate, %d opportunità sopra soglia", len(opps), len(actionable))
-    if notify and actionable:
-        n = Notifier(cfg.get("notifications", {}), Path(out.get("state", "state/alerts.json")))
-        log.info("Notifiche inviate: %d", n.notify(actionable))
+    collect = _Collect()
+    logging.getLogger().addHandler(collect)
+    try:
+        opps = scan(cfg)
+        print_table(opps)
+        out = cfg.get("output", {})
+        append_csv(opps, Path(out.get("csv", "data/scans.csv")))
+        actionable = [o for o in opps if o.actionable]
+        log.info("%d coppie analizzate, %d opportunità sopra soglia", len(opps), len(actionable))
+        if notify and actionable:
+            n = Notifier(cfg.get("notifications", {}), Path(out.get("state", "state/alerts.json")))
+            log.info("Notifiche inviate: %d", n.notify(actionable))
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            github_summary(opps, collect.records)
+    finally:
+        logging.getLogger().removeHandler(collect)
 
 
 def main() -> None:
