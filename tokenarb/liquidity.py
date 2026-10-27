@@ -25,6 +25,7 @@ class PoolInfo:
     dex: str
     reserve_usd: float
     volume_24h_usd: float
+    token_price_usd: float | None = None   # prezzo del token richiesto nel pool
 
 
 @dataclass
@@ -53,15 +54,23 @@ def _get(url: str, params: dict | None = None) -> dict:
     return {}
 
 
-def _pool(obj: dict) -> PoolInfo:
+def _pool(obj: dict, token_addr: str = "") -> PoolInfo:
     a = obj.get("attributes", {})
-    dex = (obj.get("relationships", {}).get("dex", {}).get("data") or {}).get("id", "?")
+    rel = obj.get("relationships", {})
+    dex = (rel.get("dex", {}).get("data") or {}).get("id", "?")
+    base_id = ((rel.get("base_token", {}).get("data") or {}).get("id") or "").lower()
+    side = "base_token_price_usd" if base_id.endswith(token_addr.lower()) else "quote_token_price_usd"
+    try:
+        px = float(a.get(side)) if a.get(side) is not None else None
+    except (TypeError, ValueError):
+        px = None
     return PoolInfo(
         address=a.get("address", ""),
         name=a.get("name", ""),
         dex=dex,
         reserve_usd=float(a.get("reserve_in_usd") or 0),
         volume_24h_usd=float((a.get("volume_usd") or {}).get("h24") or 0),
+        token_price_usd=px,
     )
 
 
@@ -75,10 +84,10 @@ def token_pools(addresses: List[str]) -> Dict[str, TokenLiquidity]:
         except Exception as e:  # noqa: BLE001
             log.warning("GeckoTerminal multi: %s", e)
             continue
-        pools = {p["id"]: _pool(p) for p in data.get("included", []) if p.get("type") == "pool"}
+        raw = {p["id"]: p for p in data.get("included", []) if p.get("type") == "pool"}
         for tok in data.get("data", []):
             addr = tok.get("attributes", {}).get("address", "").lower()
             refs = tok.get("relationships", {}).get("top_pools", {}).get("data", []) or []
             if addr in out:
-                out[addr].pools = [pools[r["id"]] for r in refs if r.get("id") in pools]
+                out[addr].pools = [_pool(raw[r["id"]], addr) for r in refs if r.get("id") in raw]
     return out

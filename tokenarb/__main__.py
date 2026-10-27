@@ -116,7 +116,8 @@ def list_tokens_cmd(with_liquidity: bool) -> None:
         for t in with_pools:
             i = liq[t.address.lower()]
             top = max(i.pools, key=lambda p: p.reserve_usd)
-            rows.append(f"{t.symbol:<9} liq=${i.total_usd:>12,.0f}  pool={len(i.pools)}  "
+            px = f"{top.token_price_usd:,.2f}" if top.token_price_usd else "n/d"
+            rows.append(f"{t.symbol:<9} px={px:>9}  liq=${i.total_usd:>12,.0f}  pool={len(i.pools)}  "
                         f"top={top.dex} {top.name} vol24h=${top.volume_24h_usd:,.0f}")
         no_pools = [t.symbol for t in toks if t not in with_pools]
         gh_notice("Liquidità token", head + "\n" + "\n".join(rows))
