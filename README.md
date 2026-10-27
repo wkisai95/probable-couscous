@@ -1,60 +1,72 @@
 # probable-couscous · tokenarb
 
-Scanner che confronta il prezzo degli **stock tokenizzati** (xStocks su Kraken e Bybit) con il prezzo delle stesse azioni **quotate a Wall Street**, ogni **15 minuti**, calcola la **size ottimale e il profitto netto** dell'arbitraggio e invia **notifiche** (Telegram, Discord, ntfy).
+Scanner **on-chain su Base** che confronta i **tokenized stocks emessi da Coinbase** (standard B20: AAPLc, NVDAc, TSLAc…) con il prezzo delle stesse azioni a **Wall Street**. Gira ogni **15 minuti**, calcola **size ottimale e profitto netto** dell'arbitraggio e invia **notifiche** (Telegram, Discord, ntfy).
 
 ## Come funziona
 
-1. **Prezzo Borsa**: ultimo prezzo a 1 minuto da Yahoo Finance (incluso pre/after-market) o da Finnhub.
-2. **Prezzo token**: order book completo del venue (Kraken `AAPLxUSD`, Bybit `AAPLXUSDT` convertito da USDT a USD).
-3. **Gap** = (mid del token − prezzo Borsa) / prezzo Borsa, in basis point.
-4. **Direzione**: token sotto il prezzo di Borsa → *compra token / vendi azione*; sopra → *vendi token / compra azione*.
-5. **Size e profitto**: lo scanner "cammina" l'order book livello per livello. Ogni livello peggiora il prezzo medio, quindi il profitto netto cresce, raggiunge un massimo e poi cala: lo scanner trova il punto massimo entro `max_notional_usd`.
+1. **Solo token Coinbase.** La lista arriva dall'API ufficiale `api.coinbase.com/v1/tokenized-stocks`, che dà indirizzo, decimali e `multiplier` di ogni token. I token sono identificati per indirizzo, quindi eventuali copie con lo stesso ticker vengono ignorate.
+2. **Prezzo on-chain eseguibile.** Le quote arrivano dall'aggregatore KyberSwap su Base, che instrada su Aerodrome, Uniswap e gli altri pool. Il prezzo include già fee dei pool, slippage reale per la size e costo del gas.
+3. **Prezzo equo per token:**
 
    ```
-   netto = quantità × (prezzo vendita − prezzo acquisto)
-           − fee taker venue − commissioni broker − metà spread azione − costi fissi
+   prezzo Borsa (Yahoo/Finnhub) × multiplier
    ```
 
-   Riporta anche il risultato con una size fissa (`trade_size_usd`) per confronto.
-6. **Filtri**: notifica solo se la Borsa è aperta (sessioni in `tradable_sessions`), il prezzo è fresco e profitto netto ≥ `min_net_profit_usd` e ≥ `min_net_bps`. Gli alert ripetuti sono silenziati per `cooldown_minutes`, salvo allargamento del gap.
+   Il multiplier assorbe dividendi e split (1 token ≠ sempre 1 azione). Come controllo incrociato si leggono i feed Chainlink *Base Tokenized Equities*, che fanno anche da riserva se Yahoo non risponde.
+4. **Direzione:**
+   - token sotto il prezzo di Borsa → **compra il token con USDC su Base + short dell'azione**;
+   - token sopra → **vendi il token per USDC + compra l'azione**.
+5. **Size del profitto.** Su un AMM il prezzo medio peggiora con la size: il profitto netto sale, tocca un massimo e poi scende. Lo scanner chiede quote reali su una scala di size (250 $ → 50.000 $), si ferma quando il profitto cala e raffina attorno al massimo.
 
-## Avvio rapido (locale o VPS)
+   ```
+   netto = valore copertura in Borsa − USDC spesi (o il contrario)
+           − gas − commissioni broker − metà spread azione − costi fissi
+   ```
+
+   La notifica riporta la size ottimale, il netto, la scala *size → netto* e il risultato con una size fissa di confronto.
+6. **Filtri.** Notifica solo se:
+   - la Borsa è aperta (si può coprire);
+   - il prezzo di riferimento è fresco;
+   - il contratto non ha funzioni in pausa;
+   - il netto supera le soglie.
+
+   Lo stesso alert non si ripete per 60 minuti, salvo che il gap si allarghi.
+
+## Avvio rapido
 
 ```bash
 pip install -r requirements.txt
 python -m tokenarb scan --no-notify   # una scansione, tabella a console
 python -m tokenarb run                 # loop ogni 15 minuti (:00 :15 :30 :45)
+python -m tokenarb test-notify         # prova le notifiche
 ```
 
-Ogni scansione viene salvata in `data/scans.csv`.
+Lo storico di ogni scansione finisce in `data/scans.csv`.
 
 ## Notifiche
 
-Imposta una o più variabili d'ambiente (o secret su GitHub):
-
-| Canale   | Variabili |
-|----------|-----------|
+| Canale   | Variabili d'ambiente / secret GitHub |
+|----------|--------------------------------------|
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 | Discord  | `DISCORD_WEBHOOK_URL` |
 | ntfy     | `NTFY_TOPIC` (opz. `NTFY_SERVER`) |
 
-Prova: `python -m tokenarb test-notify`
+## GitHub Actions
 
-## GitHub Actions (ogni 15 minuti)
+`.github/workflows/scanner.yml` lancia una scansione ogni 15 minuti; si può avviare anche a mano da *Actions → Run workflow*. Le notifiche si attivano aggiungendo i secret in *Settings → Secrets and variables → Actions*. Il cron di GitHub può ritardare di qualche minuto.
 
-Il workflow `.github/workflows/scanner.yml` esegue una scansione ogni 15 minuti. Aggiungi i secret in *Settings → Secrets and variables → Actions*. Lo storico CSV è scaricabile come artifact di ogni esecuzione.
+## Configurazione (`config.yaml`)
 
-**Limiti noti**
-- I runner GitHub sono negli USA e **Bybit blocca gli IP USA**: sul workflow Bybit è disattivato di default (variabile `TOKENARB_DISABLE_VENUES`). Per includerlo, esegui `python -m tokenarb run` su un server europeo.
-- Il cron di GitHub può ritardare di qualche minuto nei momenti di traffico.
-
-## Configurazione
-
-Tutto è in `config.yaml`: ticker, simboli per venue, fee, costi broker, soglie, capitale massimo, sessioni operabili, moltiplicatore azioni/token.
+- **Ticker:** vuoto = tutti i token Coinbase.
+- **Rete e asset:** RPC di Base, indirizzo USDC, feed Chainlink.
+- **Costi:** commissioni del broker per la copertura.
+- **Sizing:** scala delle size, capitale massimo, soglie di notifica.
+- **Sessioni operabili.**
 
 ## Avvertenze
 
-- Fuori dagli orari di Borsa il token continua a quotare ma l'azione no: il gap è **indicativo** e non coperto. Lo scanner lo registra ma non lo notifica.
-- La strategia *compra token / vendi azione* richiede di poter andare short sull'azione (o di possederla). *Vendi token* richiede inventario di token.
-- Verifica le fee effettive del tuo account: i valori in `config.yaml` sono indicativi.
+- I token si scambiano 24/7, la Borsa no. Fuori orario il gap è registrato ma **non notificato**: non c'è copertura possibile e il feed Chainlink è fermo.
+- *Compra token / short azione* richiede di poter andare short. *Vendi token* richiede inventario di token.
+- Questo scanner rileva e misura le opportunità, **non esegue operazioni**.
+- I token Coinbase sono offerti solo in giurisdizioni idonee fuori dagli USA (Reg. S). Verifica di poterli detenere.
 - Non è consulenza finanziaria.

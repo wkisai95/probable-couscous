@@ -5,81 +5,65 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Tuple
 
-Level = Tuple[float, float]  # (prezzo, quantità)
+
+@dataclass
+class CbToken:
+    """Stock tokenizzato emesso da Coinbase (standard B20) su Base."""
+    address: str
+    symbol: str          # es. AAPLc
+    ticker: str          # es. AAPL
+    name: str
+    decimals: int
+    multiplier: float    # azioni per token (dividendi/split), 1.0 al lancio
+    nav_price: Optional[float] = None
+    nav_updated_at: Optional[datetime] = None
+    paused_features: List[int] = field(default_factory=list)
 
 
 @dataclass
-class OrderBook:
-    bids: List[Level] = field(default_factory=list)  # ordinati dal prezzo più alto
-    asks: List[Level] = field(default_factory=list)  # ordinati dal prezzo più basso
-
-    @property
-    def best_bid(self) -> Optional[float]:
-        return self.bids[0][0] if self.bids else None
-
-    @property
-    def best_ask(self) -> Optional[float]:
-        return self.asks[0][0] if self.asks else None
-
-    @property
-    def mid(self) -> Optional[float]:
-        if self.best_bid is None or self.best_ask is None:
-            return None
-        return (self.best_bid + self.best_ask) / 2
-
-    def scaled(self, price_factor: float) -> "OrderBook":
-        """Converte i prezzi (es. USDT -> USD)."""
-        return OrderBook(
-            bids=[(p * price_factor, q) for p, q in self.bids],
-            asks=[(p * price_factor, q) for p, q in self.asks],
-        )
-
-
-@dataclass
-class TokenQuote:
-    venue: str
-    ticker: str          # ticker azionario sottostante, es. AAPL
-    symbol: str          # simbolo sul venue, es. AAPLxUSD
-    book: OrderBook
-    fetched_at: datetime
+class DexQuote:
+    amount_in: float     # unità umane (USDC o token)
+    amount_out: float
+    gas_usd: float       # gas L2 + fee L1
 
 
 @dataclass
 class RefQuote:
     ticker: str
-    price: float
-    as_of: datetime      # timestamp dell'ultimo prezzo
+    price: float         # prezzo per azione (yahoo/finnhub) o per token (chainlink)
+    as_of: datetime
     source: str
+    per_token: bool = False   # True se già moltiplicato (feed Chainlink)
 
 
 @dataclass
 class SizingResult:
     direction: str             # "buy_token_sell_stock" | "sell_token_buy_stock"
-    qty: float                 # numero di token (= azioni * moltiplicatore)
-    notional_usd: float
-    token_vwap: float
-    stock_price: float         # prezzo di esecuzione stimato lato azione (per token)
+    notional_usd: float        # USDC spesi (buy) o controvalore token venduti (sell)
+    tokens: float
+    exec_price: float          # prezzo medio on-chain per token (fee DEX incluse)
+    fair_price: float          # prezzo Borsa per token (azione × multiplier)
     gross_profit_usd: float
-    fees_usd: float
+    costs_usd: float           # gas + costi lato azione
     net_profit_usd: float
     net_bps: float
-    levels_used: int
+    ladder: List[Tuple[float, float]] = field(default_factory=list)  # (size $, netto $)
 
 
 @dataclass
 class Opportunity:
     ticker: str
-    venue: str
     symbol: str
-    session: str               # regular | pre | post | closed
-    ref_price: float           # prezzo Wall Street (per token, già moltiplicato)
+    address: str
+    session: str
+    fair_price: float          # per token
     ref_source: str
     ref_age_min: float
-    token_bid: float
-    token_ask: float
-    token_mid: float
-    gap_bps: float             # (mid token - ref) / ref in bps, segno = premio/sconto
-    best: Optional[SizingResult]       # size ottimale
-    fixed: Optional[SizingResult]      # size configurata (trade_size_usd)
-    actionable: bool           # mercato aperto, dato fresco, soglie superate
+    dex_buy_price: float       # prezzo di acquisto on-chain per piccola size
+    dex_sell_price: float      # prezzo di vendita on-chain per piccola size
+    gap_bps: float             # mid on-chain vs Borsa
+    chainlink_price: Optional[float]
+    best: Optional[SizingResult]
+    fixed: Optional[SizingResult]
+    actionable: bool
     notes: List[str] = field(default_factory=list)

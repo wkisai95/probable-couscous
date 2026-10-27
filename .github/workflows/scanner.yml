@@ -1,4 +1,4 @@
-name: Tokenized stocks arbitrage scanner
+name: Coinbase tokenized stocks (Base) arbitrage scanner
 
 on:
   schedule:
@@ -40,8 +40,6 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          # I runner GitHub sono negli USA: Bybit risponde 403 agli IP USA.
-          TOKENARB_DISABLE_VENUES: ${{ vars.TOKENARB_DISABLE_VENUES || 'bybit' }}
         run: python -m tokenarb scan
 
       - name: Upload scan log

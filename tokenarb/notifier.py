@@ -23,23 +23,28 @@ DIR_LABEL = {
 def format_opportunity(o: Opportunity) -> str:
     b, f = o.best, o.fixed
     lines = [
-        f"⚡ {o.ticker} @ {o.venue} ({o.symbol})",
-        f"Gap: {o.gap_bps:+.0f} bps | token mid {o.token_mid:.2f} vs Borsa {o.ref_price:.2f} "
+        f"⚡ {o.symbol} su Base (Coinbase)",
+        f"Gap: {o.gap_bps:+.0f} bps | on-chain buy {o.dex_buy_price:.2f} / sell "
+        f"{o.dex_sell_price:.2f} vs Borsa {o.fair_price:.2f} per token "
         f"({o.ref_source}, sessione {o.session})",
     ]
     if b:
         lines += [
             f"➡️ {DIR_LABEL[b.direction]}",
-            f"Size ottimale: {b.qty:.4f} token ≈ ${b.notional_usd:,.0f} "
-            f"(VWAP {b.token_vwap:.2f}, {b.levels_used} livelli)",
+            f"Size ottimale: ${b.notional_usd:,.0f} = {b.tokens:.4f} {o.symbol} "
+            f"(prezzo medio on-chain {b.exec_price:.2f})",
             f"Profitto netto: ${b.net_profit_usd:,.2f} ({b.net_bps:.0f} bps) "
-            f"| lordo ${b.gross_profit_usd:,.2f} - costi ${b.fees_usd:,.2f}",
+            f"| lordo ${b.gross_profit_usd:,.2f} - costi ${b.costs_usd:,.2f}",
         ]
+        if b.ladder:
+            lines.append("Scala size→netto: " + ", ".join(
+                f"${s:,.0f}→${p:,.0f}" for s, p in b.ladder))
     if f:
         lines.append(f"Con size fissa ${f.notional_usd:,.0f}: netto ${f.net_profit_usd:,.2f} "
                      f"({f.net_bps:.0f} bps)")
     if o.notes:
         lines.append("Note: " + "; ".join(o.notes))
+    lines.append(f"https://basescan.org/token/{o.address}")
     return "\n".join(lines)
 
 
@@ -57,7 +62,7 @@ class Notifier:
                 self.state = {}
 
     def _should_send(self, o: Opportunity, now: datetime) -> bool:
-        key = f"{o.ticker}|{o.venue}|{o.best.direction if o.best else ''}"
+        key = f"{o.address}|{o.best.direction if o.best else ''}"
         prev = self.state.get(key)
         if prev:
             last = datetime.fromisoformat(prev["at"])

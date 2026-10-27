@@ -1,36 +1,45 @@
-# Configurazione dello scanner tokenarb
+# tokenarb – stock tokenizzati Coinbase (B20) su Base vs Wall Street
 
-interval_minutes: 15          # frequenza del loop locale (`python -m tokenarb run`)
-reference_source: yahoo       # yahoo (gratuito, include pre/after-market) | finnhub (FINNHUB_API_KEY)
+interval_minutes: 15          # loop locale (`python -m tokenarb run`)
+reference_source: yahoo       # yahoo (gratuito, con pre/after-market) | finnhub (FINNHUB_API_KEY)
 
-# Ticker azionari da confrontare con la versione tokenizzata (xStocks)
-tickers: [AAPL, TSLA, NVDA, MSFT, AMZN, GOOGL, META, COIN, MSTR, HOOD, CRCL, SPY, QQQ]
+# Ticker da monitorare. Vuoto = tutti i token restituiti dall'API Coinbase.
+# Lancio (ago 2026): AAPL AMZN GOOGL META MSFT MSTR NVDA SNDK SPCX TSLA
+tickers: []
 
-# Azioni rappresentate da 1 token (default 1.0). Modificare se un token
-# accumula dividendi o ha un rapporto diverso.
-shares_per_token: {}
-#  AAPL: 1.0
+# Simbolo Yahoo se diverso dal ticker
+yahoo_symbols: {}
 
-# Sessioni in cui l'arbitraggio è considerato eseguibile (si può coprire in Borsa)
-tradable_sessions: [regular]  # aggiungere pre / post se il broker lo consente
+# Sessioni in cui è possibile coprirsi in Borsa (aggiungere pre/post se il broker lo consente)
+tradable_sessions: [regular]
 
-venues:
-  kraken:
-    enabled: true
-    symbol_format: "{ticker}xUSD"   # es. AAPLxUSD
-    symbol_overrides: {}
-    taker_fee_bps: 26               # verificare il proprio livello commissionale
-    fixed_cost_usd: 0
-    depth: 100
-  bybit:
-    enabled: true                   # Bybit blocca IP USA: disattivare se gira su GitHub Actions
-    symbol_format: "{ticker}XUSDT"  # es. AAPLXUSDT (prezzi convertiti USDT -> USD)
-    symbol_overrides: {}
-    taker_fee_bps: 10
-    fixed_cost_usd: 0
-    depth: 200
+base:
+  rpc_url: https://mainnet.base.org
+  usdc:
+    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    decimals: 6
 
-stock_costs:                  # lato broker azioni
+dex:
+  provider: kyberswap         # instrada su Aerodrome, Uniswap e gli altri pool di Base
+  url: https://aggregator-api.kyberswap.com/base/api/v1/routes
+  client_id: tokenarb-scanner
+  delay_seconds: 0.35         # pausa tra richieste per evitare rate limit
+
+# Feed Chainlink "Base Tokenized Equities" (prezzo per token, 8 decimali)
+# Usati come controllo incrociato e come riserva se Yahoo non risponde.
+chainlink_feeds:
+  AAPL: "0x787f13dEa48Db0897CbCDD985de77809D837F988"
+  AMZN: "0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295"
+  GOOGL: "0x5bF49E0ffA937CE2FfF033c739aD7C634c4D34F2"
+  META: "0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D"
+  MSFT: "0xeB10A6c9aa7E537aEd766C08c35Dae35B321b18c"
+  MSTR: "0xB3cE282CD188b35DA0E38D8Bc7d58e33173D202a"
+  NVDA: "0x04689a41629776563E6822F76f2e57D148d28513"
+  SNDK: "0x388b0dC46C0Fb05A74BeE0994fa5b02c6Fcca2eA"
+  SPCX: "0x6A634B235903C4ad6376892180d6fF8612e3Fa68"
+  TSLA: "0xFaf869185383a24F8cb00e27BdA6b63B9905DCb4"
+
+stock_costs:                  # lato broker azioni (copertura)
   fee_bps: 0
   fee_per_share: 0.005        # es. IBKR Pro fixed
   fixed_cost_usd: 0
@@ -38,15 +47,18 @@ stock_costs:                  # lato broker azioni
   half_spread_bps_extended: 15
 
 thresholds:
-  min_net_profit_usd: 20      # profitto netto minimo per notificare
-  min_net_bps: 30             # rendimento netto minimo (bps sul controvalore)
-  max_notional_usd: 25000     # capitale massimo per singola operazione
-  trade_size_usd: 1000        # size fissa di confronto mostrata nelle notifiche
-  max_ref_age_minutes: 20     # oltre, il prezzo Borsa è considerato vecchio
+  probe_usd: 100              # size piccola per misurare buy/sell on-chain
+  ladder_usd: [250, 500, 1000, 2500, 5000, 10000, 25000, 50000]
+  max_notional_usd: 25000     # capitale massimo per operazione
+  trade_size_usd: 1000        # size fissa mostrata per confronto
+  min_net_profit_usd: 20      # soglie per la notifica
+  min_net_bps: 30
+  max_ref_age_minutes: 20
+  chainlink_divergence_bps: 100
 
 notifications:
-  cooldown_minutes: 60        # non ripetere lo stesso alert prima di...
-  rearm_if_gap_widens_bps: 25 # ...a meno che il gap si allarghi di almeno X bps
+  cooldown_minutes: 60
+  rearm_if_gap_widens_bps: 25
 
 output:
   csv: data/scans.csv

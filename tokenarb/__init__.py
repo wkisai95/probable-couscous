@@ -1,2 +1,2 @@
-"""Scanner di arbitraggio tra stock tokenizzati (xStocks) e azioni quotate a Wall Street."""
-__version__ = "0.1.0"
+"""Scanner di arbitraggio tra gli stock tokenizzati Coinbase su Base e Wall Street."""
+__version__ = "0.2.0"
