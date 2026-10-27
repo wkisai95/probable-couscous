@@ -211,62 +211,98 @@ object Api {
     }
 
     // ---------------------------------------------------------------- GeckoTerminal
+    private const val GECKO_THREADS = 4
+
     /**
-     * Scoperta (lenta, ~25 s): pool più liquida di ogni token e liquidità totale.
-     * Serve solo a trovare i token che DexScreener non indicizza; i blocchi falliti vengono saltati.
+     * Pool più liquida di ogni token e liquidità totale da GeckoTerminal (richieste parallele
+     * da 30 indirizzi). Completa DexScreener: trova le pool che non indicizza. -> (prezzi, richieste fallite)
      */
-    fun gecko(addresses: List<String>): Map<String, PoolPrice> {
-        val out = mutableMapOf<String, PoolPrice>()
+    fun gecko(addresses: List<String>): Pair<Map<String, PoolPrice>, Int> {
+        val out = ConcurrentHashMap<String, PoolPrice>()
+        val failed = AtomicInteger(0)
+        val chunks = addresses.chunked(30)
+        if (chunks.isEmpty()) return Pair(out, 0)
         val headers = mapOf("Accept" to "application/json;version=20230302")
-        for (chunk in addresses.chunked(30)) {
-            val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
-                chunk.joinToString(",") + "?include=top_pools"
-            val text = try {
-                try {
-                    request(url, headers = headers)
-                } catch (e: HttpError) {
-                    if (e.status != 429) throw e
-                    Thread.sleep(3_000)
-                    request(url, headers = headers)
-                }
-            } catch (e: Exception) {
-                continue
-            }
-            val o = try { JSONObject(text) } catch (e: Exception) { continue }
-            val pools = mutableMapOf<String, JSONObject>()
-            val inc = o.optJSONArray("included") ?: JSONArray()
-            for (i in 0 until inc.length()) {
-                val p = inc.getJSONObject(i)
-                if (p.optString("type") == "pool") pools[p.optString("id")] = p
-            }
-            val data = o.optJSONArray("data") ?: JSONArray()
-            for (i in 0 until data.length()) {
-                val t = data.getJSONObject(i)
-                val a = t.optJSONObject("attributes") ?: continue
-                val addr = a.optString("address").lowercase()
-                if (addr.isEmpty()) continue
-                val refs = t.optJSONObject("relationships")?.optJSONObject("top_pools")
-                    ?.optJSONArray("data") ?: JSONArray()
-                var reserve = 0.0
-                var top: JSONObject? = null
-                var topReserve = -1.0
-                for (j in 0 until refs.length()) {
-                    val p = pools[refs.getJSONObject(j).optString("id")] ?: continue
-                    val r = p.optJSONObject("attributes")?.optString("reserve_in_usd")?.toDoubleOrNull() ?: 0.0
-                    reserve += r
-                    if (r > topReserve) {
-                        topReserve = r
-                        top = p
+        val pool = Executors.newFixedThreadPool(minOf(GECKO_THREADS, chunks.size))
+        try {
+            for (chunk in chunks) {
+                pool.execute {
+                    val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
+                        chunk.joinToString(",") + "?include=top_pools"
+                    var text: String? = null
+                    for (attempt in 0..2) {
+                        try {
+                            text = request(url, headers = headers)
+                            break
+                        } catch (e: HttpError) {
+                            if (e.status != 429 || attempt == 2) break
+                            Thread.sleep(1_500L * (attempt + 1))   // limite di frequenza
+                        } catch (e: Exception) {
+                            break
+                        }
+                    }
+                    val body = text
+                    if (body == null) {
+                        failed.incrementAndGet()
+                    } else {
+                        try {
+                            parseGecko(JSONObject(body), out)
+                        } catch (e: Exception) {
+                            failed.incrementAndGet()
+                        }
                     }
                 }
-                val price = a.optString("price_usd").toDoubleOrNull()?.takeIf { it > 0 } ?: continue
-                val dexId = top?.optJSONObject("relationships")?.optJSONObject("dex")
-                    ?.optJSONObject("data")?.optString("id") ?: "geckoterminal"
-                val pairAddr = top?.optJSONObject("attributes")?.optString("address")
-                out[addr] = PoolPrice(price, reserve, dexId, pairAddr)
             }
+        } finally {
+            pool.shutdown()
+            pool.awaitTermination(120, TimeUnit.SECONDS)
         }
-        return out
+        return Pair(out, failed.get())
+    }
+
+    private fun parseGecko(o: JSONObject, out: ConcurrentHashMap<String, PoolPrice>) {
+        val pools = mutableMapOf<String, JSONObject>()
+        val inc = o.optJSONArray("included") ?: JSONArray()
+        for (i in 0 until inc.length()) {
+            val p = inc.getJSONObject(i)
+            if (p.optString("type") == "pool") pools[p.optString("id")] = p
+        }
+        val data = o.optJSONArray("data") ?: JSONArray()
+        for (i in 0 until data.length()) {
+            val t = data.getJSONObject(i)
+            val a = t.optJSONObject("attributes") ?: continue
+            val addr = a.optString("address").lowercase()
+            if (addr.isEmpty()) continue
+            val refs = t.optJSONObject("relationships")?.optJSONObject("top_pools")
+                ?.optJSONArray("data") ?: JSONArray()
+            var reserve = 0.0
+            var top: JSONObject? = null
+            var topReserve = -1.0
+            for (j in 0 until refs.length()) {
+                val p = pools[refs.getJSONObject(j).optString("id")] ?: continue
+                val r = p.optJSONObject("attributes")?.optString("reserve_in_usd")?.toDoubleOrNull() ?: 0.0
+                reserve += r
+                if (r > topReserve) {
+                    topReserve = r
+                    top = p
+                }
+            }
+            // prezzo del token nella sua pool principale; in mancanza, il prezzo medio del token
+            var price: Double? = null
+            if (top != null) {
+                val pa = top.optJSONObject("attributes")
+                val baseId = top.optJSONObject("relationships")?.optJSONObject("base_token")
+                    ?.optJSONObject("data")?.optString("id")?.lowercase() ?: ""
+                price = if (baseId.endsWith(addr)) pa?.optString("base_token_price_usd")?.toDoubleOrNull()
+                else pa?.optString("quote_token_price_usd")?.toDoubleOrNull()
+            }
+            if (price == null || !(price > 0)) price = a.optString("price_usd").toDoubleOrNull()
+            if (price == null || !(price > 0) || !price.isFinite()) continue
+            val dexId = top?.optJSONObject("relationships")?.optJSONObject("dex")
+                ?.optJSONObject("data")?.optString("id") ?: "geckoterminal"
+            val pairAddr = top?.optJSONObject("attributes")?.optString("address")
+            out[addr] = PoolPrice(price, reserve, dexId, pairAddr)
+        }
     }
 
     // ---------------------------------------------------------------- KyberSwap

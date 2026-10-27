@@ -92,15 +92,13 @@ object Store {
     }
 
     // ------------------------------------------------------------ stato tra le scansioni
-    /** Elenco token in cache, token senza percorso di scambio, scoperta GeckoTerminal in cache. */
+    /** Elenco token in cache e token senza percorso di scambio. */
     fun loadState(ctx: Context): Scanner.State {
         val p = prefs(ctx)
         return Scanner.State(
             tokensJson = p.getString("tokens_cache", null),
             tokensAt = p.getLong("tokens_cache_at", 0L),
             noRoute = ConcurrentHashMap(loadNoRoute(ctx)),
-            discoveryJson = p.getString("discovery_cache", null),
-            discoveryAt = p.getLong("discovery_cache_at", 0L),
         )
     }
 
@@ -108,8 +106,8 @@ object Store {
         prefs(ctx).edit()
             .putString("tokens_cache", st.tokensJson)
             .putLong("tokens_cache_at", st.tokensAt)
-            .putString("discovery_cache", st.discoveryJson)
-            .putLong("discovery_cache_at", st.discoveryAt)
+            .remove("discovery_cache")
+            .remove("discovery_cache_at")
             .apply()
         saveNoRoute(ctx, st.noRoute)
     }

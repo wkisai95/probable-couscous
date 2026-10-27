@@ -1,12 +1,11 @@
 package com.wkisai.tokenarb
 
 import org.json.JSONArray
-import org.json.JSONObject
 import java.time.Instant
 import java.util.Collections
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -15,12 +14,13 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Scansione in tre fasi:
- *  1. prezzi delle pool token/USDC (DexScreener, Aero preferita: ~0,2 s per tutti i token);
- *     i token con liquidità che DexScreener non indicizza (scoperti con GeckoTerminal ogni 6 ore,
- *     in background) vengono prezzati con una quota KyberSwap diretta;
- *  2. confronto con Wall Street: gli arbitraggi vanno subito a schermo, poi si controllano le posizioni;
- *  3. verifica on-chain (KyberSwap, in parallelo) di prezzo eseguibile, size ottimale e profitto netto.
+ * Scansione a ogni giro:
+ *  1. DexScreener (pool token/USDC, Aero preferita, ~0,2 s): confronto con Wall Street e
+ *     arbitraggi subito a schermo; parte la verifica on-chain (KyberSwap) dei candidati;
+ *  2. GeckoTerminal subito dopo: aggiunge i token che DexScreener non indicizza e sostituisce
+ *     il prezzo quando trova una pool molto più liquida; i nuovi candidati vanno in verifica;
+ *  3. controllo delle posizioni con i prezzi migliori delle due fonti;
+ *  4. fine della verifica on-chain: prezzo eseguibile, size ottimale e profitto netto.
  */
 object Scanner {
     private val LADDER = listOf(500.0, 1500.0, 4000.0, 10000.0, 25000.0, 50000.0)
@@ -30,7 +30,6 @@ object Scanner {
     const val MAX_PLAUSIBLE_GAP_BPS = 2_500.0
     const val NO_ROUTE_TTL_MS = 6 * 3_600_000L
     private const val TOKENS_TTL_MS = 3_600_000L
-    private const val DISCOVERY_TTL_MS = 6 * 3_600_000L
     private const val YAHOO_THREADS = 12
     private const val KYBER_THREADS = 6
 
@@ -53,8 +52,6 @@ object Scanner {
         var tokensJson: String?,
         var tokensAt: Long,
         val noRoute: MutableMap<String, Long>,
-        var discoveryJson: String?,
-        var discoveryAt: Long,
     )
 
     private class Candidate(val token: CbToken, val fair: Double, val gap: Double, val base: Opportunity)
@@ -86,14 +83,15 @@ object Scanner {
         val session = Market.session(Instant.ofEpochMilli(started))
         val tradable = if (s.extendedTradable) setOf("regular", "pre", "post") else setOf("regular")
         val notes: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val feed: MutableList<String> = Collections.synchronizedList(mutableListOf())
         st.noRoute.entries.removeAll { it.value < started }
         val opps = ConcurrentHashMap<String, Opportunity>()
         var total = 0
-        var feedInfo = ""
 
         fun outcome(inProgress: Boolean, progress: String) = ScanOutcome(
             started, session, total, sortOpps(opps.values), synchronized(notes) { notes.toList() },
-            inProgress, progress, ((System.currentTimeMillis() - started) / 1000).toInt(), feedInfo,
+            inProgress, progress, ((System.currentTimeMillis() - started) / 1000).toInt(),
+            synchronized(feed) { feed.joinToString(" · ") },
         )
 
         // ---- elenco token (in cache per un'ora)
@@ -109,77 +107,66 @@ object Scanner {
         val posAddr = positions.map { it.address.lowercase() }.toSet()
         val scope = allTokens.filter { val a = it.address.lowercase(); a in screenAddr || a in posAddr }
 
-        // ---- scoperta delle pool non indicizzate da DexScreener (in background, ogni 6 ore)
-        val cachedDiscovery = parseDiscovery(st.discoveryJson)
-        val discoveryStale = cachedDiscovery.isEmpty() || started - st.discoveryAt > DISCOVERY_TTL_MS
-        val bg = Executors.newSingleThreadExecutor()
-        val discovery: Future<Map<String, PoolPrice>>? =
-            if (discoveryStale) bg.submit<Map<String, PoolPrice>> { Api.gecko(allTokens.map { it.address }) } else null
-        bg.shutdown()
-
-        // ---- 1. prezzi DexScreener
+        // ---- 1. DexScreener
         onUpdate(outcome(true, "Prezzi delle pool Aero (DexScreener)…"))
         val t0 = System.currentTimeMillis()
         val (dsPrices, dsFailed) = Api.dexscreener(scope.map { it.address })
-        feedInfo = "DexScreener ${System.currentTimeMillis() - t0} ms"
-        if (dsFailed > 0) notes += "DexScreener: $dsFailed richieste fallite, alcuni token potrebbero mancare"
+        feed += "DexScreener ${System.currentTimeMillis() - t0} ms"
+        if (dsFailed > 0) notes += "DexScreener: $dsFailed richieste fallite"
 
-        val fairBy = ConcurrentHashMap<String, Double>()
+        // ---- 2. GeckoTerminal parte subito dopo, in parallelo al resto
+        val gtStart = System.currentTimeMillis()
+        val gtExec = Executors.newSingleThreadExecutor()
+        val gtFuture = gtExec.submit<Pair<Map<String, PoolPrice>, Int>> { Api.gecko(scope.map { it.address }) }
+        gtExec.shutdown()
+
+        val ws = ConcurrentHashMap<String, RefQuote>()
         val priceBy = ConcurrentHashMap<String, PoolPrice>()
-        val checked = mutableSetOf<String>()
-        val noRef = Collections.synchronizedList(mutableListOf<String>())
+        val fairBy = ConcurrentHashMap<String, Double>()
+        val candidates = ConcurrentHashMap.newKeySet<String>()
+        val noRef = Collections.synchronizedSet(mutableSetOf<String>())
+        val prefilter = max(10.0, s.minBps * 0.5)
+        val verifyExec = Executors.newFixedThreadPool(KYBER_THREADS)
+        val queued = AtomicInteger(0)
+        val done = AtomicInteger(0)
+        val lastEmit = AtomicLong(0)
 
-        /** Token da prezzare con una quota diretta: liquidi altrove ma assenti o marginali su DexScreener. */
-        fun extrasFrom(disc: Map<String, PoolPrice>): Map<String, PoolPrice> = disc.filter { (a, g) ->
-            val ds = dsPrices[a]
-            g.liquidityUsd >= MIN_POOL_USD && (ds == null || ds.liquidityUsd < g.liquidityUsd / 5)
+        fun emitProgress(force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            val prev = lastEmit.get()
+            if ((force || now - prev >= 700) && lastEmit.compareAndSet(prev, now)) {
+                val gtNote = if (gtFuture.isDone) "" else " · GeckoTerminal in arrivo…"
+                onUpdate(outcome(true, "Verifica on-chain: ${done.get()}/${queued.get()}$gtNote"))
+            }
         }
 
-        /** Confronto, posizioni e verifica on-chain per un gruppo di token. */
-        fun pass(tokens: List<CbToken>, extras: Map<String, PoolPrice>) {
-            if (tokens.isEmpty()) return
-            // a) prezzi: DexScreener, oppure quota KyberSwap per i token "extra" (in parallelo con Yahoo)
-            val prices = ConcurrentHashMap<String, PoolPrice>()
-            for (t in tokens) {
-                val a = t.address.lowercase()
-                if (a !in extras) dsPrices[a]?.let { prices[a] = it }
-            }
-            val probeExec = Executors.newFixedThreadPool(KYBER_THREADS)
-            for (t in tokens.filter { it.address.lowercase() in extras }) {
-                probeExec.execute {
-                    val a = t.address.lowercase()
-                    val info = extras[a]
-                    if (info != null && a !in st.noRoute) {
-                        try {
-                            val q = Api.quote(Api.USDC, Api.USDC_DECIMALS, t.address, t.decimals, PROBE_USD)
-                            if (q.amountOut > 0) {
-                                prices[a] = PoolPrice(PROBE_USD / q.amountOut, info.liquidityUsd,
-                                    "${info.dex} · quota KyberSwap", info.pair)
-                            }
-                        } catch (e: NoRouteException) {
-                            st.noRoute[a] = started + NO_ROUTE_TTL_MS
-                        } catch (e: Exception) {
-                            notes += "${t.symbol}: quota non disponibile (${e.message?.take(60)})"
-                        }
-                    }
+        /** Verifica on-chain di un candidato, in parallelo. */
+        fun verify(c: Candidate) {
+            queued.incrementAndGet()
+            verifyExec.execute {
+                val a = c.token.address.lowercase()
+                opps[a] = try {
+                    sizeCandidate(c, s, session, tradable, st, started)
+                } catch (e: Exception) {
+                    c.base.copy(verified = true, notes = c.base.notes + "verifica non riuscita")
                 }
+                done.incrementAndGet()
+                emitProgress()
             }
-            probeExec.shutdown()
-            onUpdate(outcome(true, "Prezzi Wall Street (${tokens.size} titoli)…"))
-            val ws = fetchYahoo(tokens)
-            val cl = try {
-                Api.chainlink(FEEDS.filterKeys { k -> tokens.any { it.ticker == k } })
-            } catch (e: Exception) {
-                emptyMap()
-            }
-            probeExec.awaitTermination(90, TimeUnit.SECONDS)
+        }
 
-            // b) confronto immediato: gli arbitraggi vanno subito a schermo
-            val prefilter = max(10.0, s.minBps * 0.5)
-            val candidates = mutableListOf<Candidate>()
+        val cl = try {
+            Api.chainlink(FEEDS.filterKeys { k -> scope.any { it.ticker == k } })
+        } catch (e: Exception) {
+            emptyMap()
+        }
+
+        /** Confronto con Wall Street per un gruppo di token con i prezzi indicati. */
+        fun screen(tokens: List<CbToken>, prices: Map<String, PoolPrice>) {
             for (t in tokens) {
                 val a = t.address.lowercase()
                 val pool = prices[a] ?: continue
+                priceBy[a] = pool
                 val w = ws[t.ticker]
                 val c = cl[t.ticker]
                 val fair = pickFair(t, w, c, started, s.maxRefAgeMin)
@@ -187,10 +174,11 @@ object Scanner {
                     noRef += t.symbol
                     continue
                 }
+                noRef -= t.symbol
                 val (fairPx, src, age) = fair
                 fairBy[a] = fairPx
-                priceBy[a] = pool
                 if (a !in screenAddr) continue
+                if (candidates.contains(a)) continue   // già in verifica on-chain: decide la verifica
                 val gap = (pool.priceUsd - fairPx) / fairPx * 1e4
                 val base = Opportunity(
                     ticker = t.ticker, symbol = t.symbol, address = t.address, session = session,
@@ -208,78 +196,69 @@ object Scanner {
                     opps[a] = base.copy(verified = true,
                         notes = base.notes + "nessun percorso di scambio su KyberSwap (ricontrollo tra qualche ora)")
                 } else {
-                    candidates += Candidate(t, fairPx, gap, base)
+                    candidates.add(a)
                     opps[a] = base
-                }
-            }
-            onUpdate(outcome(true, "Verifica on-chain: 0/${candidates.size}"))
-
-            // c) posizioni aperte su questi token
-            val here = tokens.map { it.address.lowercase() }.toSet()
-            val posHere = positions.filter { it.address.lowercase() in here && it.address.lowercase() !in checked }
-            if (posHere.isNotEmpty()) {
-                val statuses = posHere.map { p ->
-                    val a = p.address.lowercase()
-                    checkPosition(p, byAddr[a], fairBy[a], priceBy[a], session, s, started)
-                }
-                checked += posHere.map { it.address.lowercase() }
-                onPositions(statuses)
-            }
-
-            // d) verifica on-chain della size, in parallelo
-            val done = AtomicInteger(0)
-            val lastEmit = AtomicLong(0)
-            parallel(candidates, KYBER_THREADS) { cand ->
-                opps[cand.token.address.lowercase()] = sizeCandidate(cand, s, session, tradable, st, started)
-                val n = done.incrementAndGet()
-                val now = System.currentTimeMillis()
-                val prev = lastEmit.get()
-                if (now - prev >= 700 && lastEmit.compareAndSet(prev, now)) {
-                    onUpdate(outcome(true, "Verifica on-chain: $n/${candidates.size}"))
+                    verify(Candidate(t, fairPx, gap, base))
                 }
             }
         }
 
-        // ---- passaggio principale: token con pool DexScreener liquida + extra già noti
-        val extras1 = extrasFrom(cachedDiscovery)
-        val main = scope.filter { t ->
+        // ---- quadro con i prezzi DexScreener: subito a schermo
+        val dsTokens = scope.filter { t ->
             val a = t.address.lowercase()
             val p = dsPrices[a]
-            a in extras1 || (p != null && (p.liquidityUsd >= MIN_POOL_USD || a in posAddr))
+            p != null && (p.liquidityUsd >= MIN_POOL_USD || a in posAddr)
         }
-        pass(main, extras1)
+        onUpdate(outcome(true, "Prezzi Wall Street (${dsTokens.size} titoli)…"))
+        ws.putAll(fetchYahoo(dsTokens))
+        screen(dsTokens, dsPrices)
+        emitProgress(force = true)
 
-        // ---- passaggio tardivo: token liquidi scoperti ora (solo quando la cache è scaduta)
-        if (discovery != null) {
-            onUpdate(outcome(true, "Cerco pool non indicizzate da DexScreener…"))
-            val fresh = try {
-                discovery.get(90, TimeUnit.SECONDS)
-            } catch (e: Exception) {
-                null
+        // ---- GeckoTerminal: completa e migliora i prezzi
+        val gt = try {
+            gtFuture.get(120, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            null
+        }
+        if (gt == null) {
+            notes += "GeckoTerminal non disponibile in questa scansione: alcuni token potrebbero mancare"
+        } else {
+            val (gtPrices, gtFailed) = gt
+            val sec = (System.currentTimeMillis() - gtStart) / 1000.0
+            feed += "GeckoTerminal " + String.format(Locale.ITALY, "%.1f s", sec)
+            if (gtFailed > 0) notes += "GeckoTerminal: $gtFailed richieste fallite"
+            // pool GeckoTerminal usata se DexScreener non ha il token o ha una pool molto meno liquida
+            val better = mutableMapOf<String, PoolPrice>()
+            for (t in scope) {
+                val a = t.address.lowercase()
+                val g = gtPrices[a] ?: continue
+                if (g.liquidityUsd < MIN_POOL_USD && a !in posAddr) continue
+                val d = dsPrices[a]
+                if (d == null || g.liquidityUsd > d.liquidityUsd * 2) better[a] = g
             }
-            if (fresh != null && fresh.isNotEmpty()) {
-                st.discoveryJson = serializeDiscovery(fresh)
-                st.discoveryAt = System.currentTimeMillis()
-                val done = main.map { it.address.lowercase() }.toSet()
-                val extras2 = extrasFrom(fresh).filterKeys { it !in done }
-                pass(scope.filter { it.address.lowercase() in extras2 }, extras2)
-            } else {
-                notes += "Scoperta delle pool non riuscita: riprovo alla prossima scansione"
-            }
+            val gtTokens = scope.filter { it.address.lowercase() in better }
+            val needWs = gtTokens.filter { !ws.containsKey(it.ticker) }
+            if (needWs.isNotEmpty()) ws.putAll(fetchYahoo(needWs))
+            screen(gtTokens, better)
+            emitProgress(force = true)
         }
 
-        // ---- posizioni senza prezzo
-        val missing = positions.filter { it.address.lowercase() !in checked }
-        if (missing.isNotEmpty()) {
-            onPositions(missing.map { p ->
-                PositionStatus(p.id, started, null, null, 0.0, null, null, null, null,
-                    "prezzo on-chain non disponibile in questa scansione")
+        // ---- posizioni, con i prezzi migliori delle due fonti
+        if (positions.isNotEmpty()) {
+            onUpdate(outcome(true, "Controllo le tue posizioni…"))
+            onPositions(positions.map { p ->
+                val a = p.address.lowercase()
+                checkPosition(p, byAddr[a], fairBy[a], priceBy[a], session, s, started)
             })
         }
 
-        val withPrice = priceBy.keys.count { it in screenAddr }
-        val skipped = screenAddr.size - withPrice
-        if (noRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${noRef.joinToString(", ")}"
+        // ---- fine della verifica on-chain
+        verifyExec.shutdown()
+        verifyExec.awaitTermination(8, TimeUnit.MINUTES)
+
+        val skipped = screenAddr.count { !priceBy.containsKey(it) }
+        val missingRef = synchronized(noRef) { noRef.sorted() }
+        if (missingRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${missingRef.joinToString(", ")}"
         if (skipped > 0) notes += "Senza pool con liquidità su Base: $skipped token (saltati)"
         return outcome(false, "")
     }
@@ -340,7 +319,10 @@ object Scanner {
             PositionStatus(p.id, now, fair, pool?.priceUsd, fraction, sellTokens, proceeds, avg, pnl, note)
 
         if (t == null) return status(note = "token non più presente nell'elenco Coinbase")
-        if (fair == null) return status(note = "prezzo di Borsa non disponibile")
+        if (fair == null) {
+            return status(note = if (pool == null) "prezzo on-chain non disponibile in questa scansione"
+            else "prezzo di Borsa non disponibile")
+        }
         if (p.tokens <= 0) return status(note = "posizione vuota")
         val target = fair * (1 - s.closeTolBps / 1e4)
         val closed = if (session != "regular") "Borsa ${Market.label(session)}: confronto con l'ultimo prezzo" else null
@@ -398,32 +380,6 @@ object Scanner {
             .thenByDescending { it.best?.netUsd ?: Double.NEGATIVE_INFINITY }
             .thenByDescending { abs(it.gapBps) }
     )
-
-    private fun serializeDiscovery(m: Map<String, PoolPrice>): String {
-        val o = JSONObject()
-        for ((k, v) in m) {
-            if (v.liquidityUsd < MIN_POOL_USD) continue
-            o.put(k, JSONObject().putD("p", v.priceUsd).putD("l", v.liquidityUsd)
-                .put("d", v.dex).put("a", v.pair ?: ""))
-        }
-        return o.toString()
-    }
-
-    private fun parseDiscovery(json: String?): Map<String, PoolPrice> {
-        if (json.isNullOrEmpty()) return emptyMap()
-        return try {
-            val o = JSONObject(json)
-            val out = mutableMapOf<String, PoolPrice>()
-            o.keys().forEach { k ->
-                val v = o.getJSONObject(k)
-                out[k] = PoolPrice(v.optDouble("p", 0.0), v.optDouble("l", 0.0), v.optString("d"),
-                    v.optString("a").ifEmpty { null })
-            }
-            out
-        } catch (e: Exception) {
-            emptyMap()
-        }
-    }
 
     /** Elenco token dall'API Coinbase, in cache per un'ora (se l'API non risponde usa la cache). */
     private fun cachedTokens(st: State, now: Long): List<CbToken> {
