@@ -86,6 +86,7 @@ class MainActivity : Activity() {
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menu.add(0, 1, 0, getString(R.string.settings))
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
         return true
     }
 
@@ -116,7 +117,12 @@ class MainActivity : Activity() {
                 Store.saveResults(this, out)
                 Notifier.notify(this, out, s)
             } catch (e: Exception) {
-                runOnUiThread { status.text = "Errore: ${e.message}" }
+                // conserva l'ultima lista valida e mostra l'errore tra gli avvisi
+                val prev = Store.loadResults(this)
+                Store.saveResults(this, ScanOutcome(
+                    System.currentTimeMillis(), Market.session(), prev?.tokensFound ?: 0,
+                    prev?.opportunities ?: emptyList(),
+                    listOf("Scansione fallita: ${e.message ?: e.javaClass.simpleName}")))
             } finally {
                 runOnUiThread {
                     scanning = false
@@ -141,7 +147,8 @@ class MainActivity : Activity() {
             append("Ultima scansione: $time · Borsa ${Market.label(out.session)}\n")
             append("${out.tokensFound} token Coinbase su Base · ${out.opportunities.size} con liquidità · ")
             append("$actionable sopra soglia")
-            if (out.errors.isNotEmpty()) append("\n⚠️ ${out.errors.size} avvisi (tocca per dettagli)")
+            if (out.errors.size == 1) append("\n⚠️ ${out.errors[0].take(140)}")
+            else if (out.errors.isNotEmpty()) append("\n⚠️ ${out.errors.size} avvisi (tocca per dettagli)")
         }
         status.setOnClickListener {
             if (out.errors.isNotEmpty()) {
