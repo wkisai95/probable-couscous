@@ -70,7 +70,26 @@ jobs:
           fi
 
       - name: Build
-        run: gradle -p android assembleRelease --stacktrace
+        run: |
+          set -o pipefail
+          gradle -p android assembleRelease --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # In caso di errore pubblica i messaggi del compilatore come annotazione della run
+      - name: Report build errors
+        if: failure()
+        run: |
+          python3 - "$RUNNER_TEMP/build.log" <<'EOF'
+          import sys
+          lines = open(sys.argv[1], errors="replace").read().splitlines()
+          errs = [l for l in lines if l.startswith("e: ") or ": error:" in l or "error: " in l[:12]]
+          if not errs:
+              i = next((k for k, l in enumerate(lines) if "What went wrong" in l), None)
+              errs = lines[i:i + 15] if i is not None else lines[-30:]
+          prefix = "file:///home/runner/work/probable-couscous/probable-couscous/"
+          msg = "\n".join(e.replace(prefix, "") for e in errs[:40])
+          msg = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=Errori di compilazione::{msg}")
+          EOF
 
       - name: Signing fingerprint
         run: |
