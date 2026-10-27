@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 15: layout classico sotto le barre di sistema (niente contenuto nascosto) -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.DarkActionBar">
+        <item name="android:colorPrimary">#0B3D91</item>
+        <item name="android:colorPrimaryDark">#072A66</item>
+        <item name="android:colorAccent">#0052FF</item>
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>

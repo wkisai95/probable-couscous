@@ -69,6 +69,24 @@ object Store {
         null
     }
 
+    /** Token senza liquidità on-chain: indirizzo -> momento in cui ricontrollarli. */
+    fun loadNoRoute(ctx: Context): MutableMap<String, Long> {
+        val out = mutableMapOf<String, Long>()
+        try {
+            val o = JSONObject(prefs(ctx).getString("no_route", "{}") ?: "{}")
+            o.keys().forEach { k -> out[k] = o.getLong(k) }
+        } catch (e: Exception) {
+            // stato illeggibile: si riparte da zero
+        }
+        return out
+    }
+
+    fun saveNoRoute(ctx: Context, m: Map<String, Long>) {
+        val o = JSONObject()
+        m.forEach { (k, v) -> o.put(k, v) }
+        prefs(ctx).edit().putString("no_route", o.toString()).apply()
+    }
+
     fun loadAlerts(ctx: Context): JSONObject = try {
         JSONObject(prefs(ctx).getString(KEY_ALERTS, "{}") ?: "{}")
     } catch (e: Exception) {

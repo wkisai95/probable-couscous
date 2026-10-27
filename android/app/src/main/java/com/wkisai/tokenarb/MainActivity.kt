@@ -86,6 +86,7 @@ class MainActivity : Activity() {
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menu.add(0, 1, 0, getString(R.string.settings))
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
         return true
     }
 
@@ -112,11 +113,18 @@ class MainActivity : Activity() {
         val s = Store.loadSettings(this)
         thread {
             try {
-                val out = Scanner.run(s) { msg -> runOnUiThread { status.text = msg } }
+                val noRoute = Store.loadNoRoute(this)
+                val out = Scanner.run(s, noRoute) { msg -> runOnUiThread { status.text = msg } }
+                Store.saveNoRoute(this, noRoute)
                 Store.saveResults(this, out)
                 Notifier.notify(this, out, s)
             } catch (e: Exception) {
-                runOnUiThread { status.text = "Errore: ${e.message}" }
+                // conserva l'ultima lista valida e mostra l'errore tra gli avvisi
+                val prev = Store.loadResults(this)
+                Store.saveResults(this, ScanOutcome(
+                    System.currentTimeMillis(), Market.session(), prev?.tokensFound ?: 0,
+                    prev?.opportunities ?: emptyList(),
+                    listOf("Scansione fallita: ${e.message ?: e.javaClass.simpleName}")))
             } finally {
                 runOnUiThread {
                     scanning = false
@@ -141,11 +149,11 @@ class MainActivity : Activity() {
             append("Ultima scansione: $time · Borsa ${Market.label(out.session)}\n")
             append("${out.tokensFound} token Coinbase su Base · ${out.opportunities.size} con liquidità · ")
             append("$actionable sopra soglia")
-            if (out.errors.isNotEmpty()) append("\n⚠️ ${out.errors.size} avvisi (tocca per dettagli)")
+            if (out.errors.isNotEmpty()) append("\nℹ️ ${out.errors.size} note (tocca qui per i dettagli)")
         }
         status.setOnClickListener {
             if (out.errors.isNotEmpty()) {
-                android.app.AlertDialog.Builder(this).setTitle("Avvisi")
+                android.app.AlertDialog.Builder(this).setTitle("Note sulla scansione")
                     .setMessage(out.errors.joinToString("\n")).setPositiveButton("OK", null).show()
             }
         }

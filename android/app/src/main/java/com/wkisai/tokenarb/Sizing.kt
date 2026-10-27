@@ -80,6 +80,18 @@ object Sizing {
         return best.copy(ladder = results.map { it.notionalUsd to it.netUsd })
     }
 
+    /** Margine per token a size minima al netto dei costi di copertura (gas escluso). */
+    fun unitEdge(direction: String, buyPx: Double, sellPx: Double, fair: Double, c: Costs): Double {
+        val hs = c.halfSpreadBps / 1e4
+        return if (direction == BUY) {
+            val stockPx = fair * (1 - hs)
+            stockPx * (1 - c.stockFeeBps / 1e4) - c.multiplier * c.stockFeePerShare - buyPx
+        } else {
+            val stockPx = fair * (1 + hs)
+            sellPx - stockPx * (1 + c.stockFeeBps / 1e4) - c.multiplier * c.stockFeePerShare
+        }
+    }
+
     fun direction(buyPx: Double, sellPx: Double, fair: Double): String? = when {
         buyPx < fair -> BUY
         sellPx > fair -> SELL

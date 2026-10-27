@@ -18,7 +18,9 @@ class ScanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val s = Store.loadSettings(applicationContext)
         try {
-            val outcome = Scanner.run(s)
+            val noRoute = Store.loadNoRoute(applicationContext)
+            val outcome = Scanner.run(s, noRoute)
+            Store.saveNoRoute(applicationContext, noRoute)
             Store.saveResults(applicationContext, outcome)
             Notifier.notify(applicationContext, outcome, s)
             Result.success()
