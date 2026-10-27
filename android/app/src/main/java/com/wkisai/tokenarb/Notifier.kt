@@ -36,9 +36,22 @@ object Notifier {
     fun usd0(v: Double) = String.format(Locale.ITALY, "$%,.0f", v)
     fun px(v: Double) = String.format(Locale.ITALY, "%.2f", v)
 
+    /** Prezzi on-chain disponibili: eseguibili (acquisto/vendita) se quotati, altrimenti prezzo medio del pool. */
+    fun dexText(o: Opportunity): String {
+        val buy = o.dexBuy
+        val sell = o.dexSell
+        return when {
+            buy != null && sell != null -> "DEX ${px(buy)} / ${px(sell)}"
+            buy != null -> "DEX acquisto ${px(buy)}"
+            sell != null -> "DEX vendita ${px(sell)}"
+            o.poolPrice != null -> "pool ${px(o.poolPrice)}"
+            else -> "DEX n/d"
+        }
+    }
+
     fun body(o: Opportunity): String = buildString {
         val b = o.best
-        append("Gap ${o.gapBps.toInt()} bps · on-chain ${px(o.dexBuy)}/${px(o.dexSell)} vs Borsa ${px(o.fairPrice)}\n")
+        append("Gap ${o.gapBps.toInt()} bps · ${dexText(o)} vs Borsa ${px(o.fairPrice)}\n")
         if (b != null) {
             append("${directionLabel(b.direction)}\n")
             append("Size ottimale ${usd0(b.notionalUsd)} (${String.format(Locale.ITALY, "%.4f", b.tokens)} ${o.symbol})\n")

@@ -2,6 +2,7 @@ package com.wkisai.tokenarb
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -21,6 +22,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -31,7 +33,6 @@ class MainActivity : Activity() {
     private lateinit var list: LinearLayout
     private lateinit var scanBtn: Button
     private lateinit var batteryBtn: Button
-    private var scanning = false
     private val expanded = mutableSetOf<String>()
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -107,54 +108,60 @@ class MainActivity : Activity() {
     }
 
     private fun scanNow() {
-        if (scanning) return
-        scanning = true
+        if (Scanner.isRunning) {
+            Toast.makeText(this, "Scansione già in corso: i risultati si aggiornano qui", Toast.LENGTH_SHORT).show()
+            return
+        }
         scanBtn.isEnabled = false
-        val s = Store.loadSettings(this)
+        scanBtn.text = "Scansione in corso…"
+        val ctx = applicationContext
+        val s = Store.loadSettings(ctx)
         thread {
+            val st = Store.loadState(ctx)
             try {
-                val noRoute = Store.loadNoRoute(this)
-                val out = Scanner.run(s, noRoute) { msg -> runOnUiThread { status.text = msg } }
-                Store.saveNoRoute(this, noRoute)
-                Store.saveResults(this, out)
-                Notifier.notify(this, out, s)
-            } catch (e: Exception) {
-                // conserva l'ultima lista valida e mostra l'errore tra gli avvisi
-                val prev = Store.loadResults(this)
-                Store.saveResults(this, ScanOutcome(
-                    System.currentTimeMillis(), Market.session(), prev?.tokensFound ?: 0,
-                    prev?.opportunities ?: emptyList(),
-                    listOf("Scansione fallita: ${e.message ?: e.javaClass.simpleName}")))
-            } finally {
-                runOnUiThread {
-                    scanning = false
-                    scanBtn.isEnabled = true
-                    render()
+                // i risultati parziali arrivano allo schermo tramite le preferenze condivise
+                val out = Scanner.runExclusive(s, st) { partial -> Store.saveResults(ctx, partial) }
+                if (out != null) {
+                    Store.saveState(ctx, st)
+                    Store.saveResults(ctx, out)
+                    Notifier.notify(ctx, out, s)
                 }
+            } catch (e: Exception) {
+                Store.saveFailure(ctx, e)
+            } finally {
+                runOnUiThread { render() }
             }
         }
     }
 
     private fun render() {
-        if (scanning) return
+        val running = Scanner.isRunning
+        scanBtn.isEnabled = !running
+        scanBtn.text = if (running) "Scansione in corso…" else "Scansiona ora"
         val out = Store.loadResults(this)
         list.removeAllViews()
         if (out == null) {
-            status.text = "Nessuna scansione ancora. Le scansioni automatiche partono ogni 15 minuti."
+            status.text = if (running) "⏳ Prima scansione in corso…"
+            else "Nessuna scansione ancora. Le scansioni automatiche partono ogni 15 minuti."
             return
         }
         val time = SimpleDateFormat("dd/MM HH:mm", Locale.ITALY).format(Date(out.timeMillis))
         val actionable = out.opportunities.count { it.actionable }
+        val sized = out.opportunities.count { it.best != null }
         status.text = buildString {
-            append("Ultima scansione: $time · Borsa ${Market.label(out.session)}\n")
-            append("${out.tokensFound} token Coinbase su Base · ${out.opportunities.size} con liquidità · ")
-            append("$actionable sopra soglia")
+            when {
+                out.inProgress && running -> append("⏳ ${out.progress} · ${out.durationSec} s\n")
+                out.inProgress -> append("Scansione interrotta: risultati parziali delle $time\n")
+                else -> append("Ultima scansione: $time (${out.durationSec} s) · Borsa ${Market.label(out.session)}\n")
+            }
+            append("${out.tokensFound} token Coinbase · ${out.opportunities.size} con liquidità · ")
+            append("$sized con size · $actionable sopra soglia")
             if (out.errors.isNotEmpty()) append("\nℹ️ ${out.errors.size} note (tocca qui per i dettagli)")
         }
         status.setOnClickListener {
             if (out.errors.isNotEmpty()) {
-                android.app.AlertDialog.Builder(this).setTitle("Note sulla scansione")
-                    .setMessage(out.errors.joinToString("\n")).setPositiveButton("OK", null).show()
+                AlertDialog.Builder(this).setTitle("Note sulla scansione")
+                    .setMessage(out.errors.joinToString("\n\n")).setPositiveButton("OK", null).show()
             }
         }
         for (o in out.opportunities) list.addView(card(o))
@@ -186,7 +193,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
         head.addView(TextView(this).apply {
-            text = if (b != null) "netto ${Notifier.usd(b.netUsd)}" else "nessun arbitraggio"
+            text = if (b != null) "netto ${Notifier.usd(b.netUsd)}" else "gap ${signed(o.gapBps)} bps"
             textSize = 15f
             gravity = Gravity.END
             setTypeface(typeface, Typeface.BOLD)
@@ -197,8 +204,8 @@ class MainActivity : Activity() {
             textSize = 13f
             setTextColor(Color.DKGRAY)
             text = buildString {
-                append("Gap ${o.gapBps.toInt()} bps · Borsa ${Notifier.px(o.fairPrice)} · ")
-                append("DEX ${Notifier.px(o.dexBuy)} / ${Notifier.px(o.dexSell)}")
+                append("Gap ${signed(o.gapBps)} bps · Borsa ${Notifier.px(o.fairPrice)} · ")
+                append(Notifier.dexText(o))
                 if (b != null) append("\n${Notifier.directionLabel(b.direction)} · size ${Notifier.usd0(b.notionalUsd)} (${b.netBps.toInt()} bps)")
             }
         })
@@ -207,8 +214,10 @@ class MainActivity : Activity() {
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(6), 0, 0)
             text = buildString {
-                append("Fonte prezzo: ${o.refSource} (${o.refAgeMin.toInt()} min fa)")
+                append("Prezzo di Borsa: ${o.refSource} (${o.refAgeMin.toInt()} min fa)")
                 o.chainlink?.let { append(" · Chainlink ${Notifier.px(it)}") }
+                o.poolPrice?.let { append("\nPrezzo medio del pool ${Notifier.px(it)}") }
+                o.liquidityUsd?.let { append(" · liquidità ${Notifier.usd0(it)}") }
                 if (b != null) {
                     append("\nPrezzo medio on-chain ${Notifier.px(b.execPrice)} · token ${String.format(Locale.ITALY, "%.4f", b.tokens)}")
                     append("\nLordo ${Notifier.usd(b.grossUsd)} − costi ${Notifier.usd(b.costsUsd)} = netto ${Notifier.usd(b.netUsd)}")
@@ -235,4 +244,6 @@ class MainActivity : Activity() {
         }
         return c
     }
+
+    private fun signed(v: Double) = (if (v > 0) "+" else "") + v.toInt()
 }

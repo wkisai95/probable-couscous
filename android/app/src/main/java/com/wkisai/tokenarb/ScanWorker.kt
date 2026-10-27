@@ -16,21 +16,22 @@ import java.util.concurrent.TimeUnit
 class ScanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val s = Store.loadSettings(applicationContext)
+        val ctx = applicationContext
+        val s = Store.loadSettings(ctx)
+        val st = Store.loadState(ctx)
         try {
-            val noRoute = Store.loadNoRoute(applicationContext)
-            val outcome = Scanner.run(s, noRoute)
-            Store.saveNoRoute(applicationContext, noRoute)
-            Store.saveResults(applicationContext, outcome)
-            Notifier.notify(applicationContext, outcome, s)
-            Result.success()
+            // se è già in corso una scansione (es. avviata dall'app) questa viene saltata
+            val outcome = Scanner.runExclusive(s, st) { partial -> Store.saveResults(ctx, partial) }
+            if (outcome != null) {
+                Store.saveState(ctx, st)
+                Store.saveResults(ctx, outcome)
+                Notifier.notify(ctx, outcome, s)
+            }
         } catch (e: Exception) {
-            val prev = Store.loadResults(applicationContext)
-            Store.saveResults(applicationContext, ScanOutcome(
-                System.currentTimeMillis(), Market.session(), prev?.tokensFound ?: 0,
-                prev?.opportunities ?: emptyList(), listOf("Scansione fallita: ${e.message}")))
-            Result.retry()
+            Store.saveFailure(ctx, e)
         }
+        // in caso di errore si riprova alla prossima esecuzione periodica
+        Result.success()
     }
 
     companion object {

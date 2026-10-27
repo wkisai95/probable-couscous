@@ -63,10 +63,38 @@ object Store {
         prefs(ctx).edit().putString(KEY_RESULTS, o.toJson().toString()).apply()
     }
 
+    /** Conserva l'ultima lista valida e registra l'errore tra le note. */
+    fun saveFailure(ctx: Context, e: Exception) {
+        val prev = loadResults(ctx)
+        saveResults(ctx, ScanOutcome(
+            System.currentTimeMillis(), Market.session(), prev?.tokensFound ?: 0,
+            prev?.opportunities ?: emptyList(),
+            listOf("Scansione fallita: ${e.message ?: e.javaClass.simpleName}"),
+        ))
+    }
+
     fun loadResults(ctx: Context): ScanOutcome? = try {
         prefs(ctx).getString(KEY_RESULTS, null)?.let { ScanOutcome.fromJson(JSONObject(it)) }
     } catch (e: Exception) {
         null
+    }
+
+    /** Stato tra le scansioni: elenco token in cache e token senza liquidità. */
+    fun loadState(ctx: Context): Scanner.State {
+        val p = prefs(ctx)
+        return Scanner.State(
+            p.getString("tokens_cache", null),
+            p.getLong("tokens_cache_at", 0L),
+            java.util.concurrent.ConcurrentHashMap(loadNoRoute(ctx)),
+        )
+    }
+
+    fun saveState(ctx: Context, st: Scanner.State) {
+        prefs(ctx).edit()
+            .putString("tokens_cache", st.tokensJson)
+            .putLong("tokens_cache_at", st.tokensAt)
+            .apply()
+        saveNoRoute(ctx, st.noRoute)
     }
 
     /** Token senza liquidità on-chain: indirizzo -> momento in cui ricontrollarli. */

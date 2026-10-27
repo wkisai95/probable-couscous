@@ -57,27 +57,42 @@ object Sizing {
     }
 
     fun optimal(direction: String, fair: Double, q: QuoteFn, c: Costs,
-                ladder: List<Double>, maxNotional: Double): SizeResult? {
-        val sizes = (ladder.filter { it <= maxNotional } + maxNotional).distinct().sorted()
+                ladder: List<Double>, maxNotional: Double): SizeResult? =
+        search(direction, fair, q, c, ladder, maxNotional, null).first
+
+    /**
+     * Sale lungo la scala di size finché il netto cresce, poi raffina attorno al massimo.
+     * Se la size fissa di confronto è nella scala ne riusa la quota. -> (ottimo, size fissa)
+     */
+    fun search(direction: String, fair: Double, q: QuoteFn, c: Costs, ladder: List<Double>,
+               maxNotional: Double, fixedSize: Double?): Pair<SizeResult?, SizeResult?> {
+        val extra = listOfNotNull(fixedSize?.takeIf { it <= maxNotional })
+        val sizes = (ladder.filter { it <= maxNotional } + maxNotional + extra).distinct().sorted()
         val results = mutableListOf<SizeResult>()
+        val sizeOf = mutableListOf<Double>()
         for (s in sizes) {
             val r = evaluate(direction, s, fair, q, c) ?: break
             results += r
+            sizeOf += s
             val n = results.size
             if (n >= 3 && results[n - 1].netUsd < results[n - 2].netUsd &&
                 results[n - 2].netUsd < results[n - 3].netUsd) break
         }
-        if (results.isEmpty()) return null
+        val fixed: SizeResult? = when {
+            fixedSize == null -> null
+            sizeOf.indexOf(fixedSize) >= 0 -> results[sizeOf.indexOf(fixedSize)]
+            else -> evaluate(direction, fixedSize, fair, q, c)
+        }
+        if (results.isEmpty()) return Pair(null, fixed)
         val i = results.indices.maxByOrNull { results[it].netUsd }!!
         var best = results[i]
         for (j in listOf(i - 1, i + 1)) {
             if (j in results.indices) {
-                val mid = (sizes[i] + sizes[j]) / 2
-                val r = evaluate(direction, mid, fair, q, c)
+                val r = evaluate(direction, (sizeOf[i] + sizeOf[j]) / 2, fair, q, c)
                 if (r != null && r.netUsd > best.netUsd) best = r
             }
         }
-        return best.copy(ladder = results.map { it.notionalUsd to it.netUsd })
+        return Pair(best.copy(ladder = results.map { it.notionalUsd to it.netUsd }), fixed)
     }
 
     /** Margine per token a size minima al netto dei costi di copertura (gas escluso). */

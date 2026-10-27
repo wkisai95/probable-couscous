@@ -21,8 +21,6 @@ object Api {
     const val USDC_DECIMALS = 6
     private const val BASE_RPC = "https://mainnet.base.org"
     private const val KYBER = "https://aggregator-api.kyberswap.com/base/api/v1/routes"
-    private const val KYBER_DELAY_MS = 350L
-    private var lastKyber = 0L
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
@@ -138,21 +136,98 @@ object Api {
         return out
     }
 
+    // ---------------------------------------------------------------- GeckoTerminal
+    /**
+     * Prezzo medio e liquidità del pool principale di ogni token: 1 richiesta ogni 30 token.
+     * Chiave della mappa: indirizzo in minuscolo. I token assenti non hanno pool indicizzati.
+     */
+    fun gecko(addresses: List<String>): Map<String, PoolData> {
+        val out = mutableMapOf<String, PoolData>()
+        for (chunk in addresses.chunked(30)) {
+            val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
+                chunk.joinToString(",") + "?include=top_pools"
+            val headers = mapOf("Accept" to "application/json;version=20230302")
+            val text = try {
+                request(url, headers = headers)
+            } catch (e: HttpError) {
+                if (e.status != 429) throw e
+                Thread.sleep(2_000)                       // limite di frequenza: un nuovo tentativo
+                request(url, headers = headers)
+            }
+            val o = JSONObject(text)
+            val pools = mutableMapOf<String, JSONObject>()
+            val inc = o.optJSONArray("included") ?: JSONArray()
+            for (i in 0 until inc.length()) {
+                val p = inc.getJSONObject(i)
+                if (p.optString("type") == "pool") pools[p.optString("id")] = p
+            }
+            val data = o.optJSONArray("data") ?: JSONArray()
+            for (i in 0 until data.length()) {
+                val t = data.getJSONObject(i)
+                val a = t.optJSONObject("attributes") ?: continue
+                val addr = a.optString("address").lowercase()
+                if (addr.isEmpty()) continue
+                val refs = t.optJSONObject("relationships")?.optJSONObject("top_pools")
+                    ?.optJSONArray("data") ?: JSONArray()
+                var reserve = 0.0
+                var bestReserve = -1.0
+                var poolPrice: Double? = null
+                for (j in 0 until refs.length()) {
+                    val p = pools[refs.getJSONObject(j).optString("id")] ?: continue
+                    val pa = p.optJSONObject("attributes") ?: continue
+                    val r = pa.optString("reserve_in_usd").toDoubleOrNull() ?: 0.0
+                    reserve += r
+                    if (r > bestReserve) {
+                        val baseId = p.optJSONObject("relationships")?.optJSONObject("base_token")
+                            ?.optJSONObject("data")?.optString("id")?.lowercase() ?: ""
+                        val px = if (baseId.endsWith(addr)) pa.optString("base_token_price_usd").toDoubleOrNull()
+                        else pa.optString("quote_token_price_usd").toDoubleOrNull()
+                        if (px != null && px > 0) {
+                            bestReserve = r
+                            poolPrice = px
+                        }
+                    }
+                }
+                val tokenPrice = a.optString("price_usd").toDoubleOrNull()?.takeIf { it > 0 }
+                val total = a.optString("total_reserve_in_usd").toDoubleOrNull() ?: 0.0
+                out[addr] = PoolData(poolPrice ?: tokenPrice, maxOf(reserve, total), refs.length() > 0)
+            }
+        }
+        return out
+    }
+
     // ---------------------------------------------------------------- KyberSwap
-    /** Quota eseguibile on-chain su Base (Aerodrome, Uniswap, ...): fee pool e slippage inclusi. */
-    @Synchronized
-    fun quote(tokenIn: String, decIn: Int, tokenOut: String, decOut: Int, amountIn: Double): DexQuote {
-        val wait = KYBER_DELAY_MS - (System.currentTimeMillis() - lastKyber)
+    /** Massimo ~8 richieste al secondo verso KyberSwap, anche da più thread. */
+    private const val KYBER_MIN_INTERVAL_MS = 125L
+    private val kyberLock = Any()
+    private var kyberNext = 0L
+
+    private fun kyberSlot() {
+        val wait = synchronized(kyberLock) {
+            val now = System.currentTimeMillis()
+            val start = maxOf(now, kyberNext)
+            kyberNext = start + KYBER_MIN_INTERVAL_MS
+            start - now
+        }
         if (wait > 0) Thread.sleep(wait)
+    }
+
+    /** Quota eseguibile on-chain su Base (Aero, Aerodrome, Uniswap, ...): fee pool e slippage inclusi. */
+    fun quote(tokenIn: String, decIn: Int, tokenOut: String, decOut: Int, amountIn: Double): DexQuote {
         val raw = BigDecimal.valueOf(amountIn).movePointRight(decIn).toBigInteger()
         val url = "$KYBER?tokenIn=$tokenIn&tokenOut=$tokenOut&amountIn=$raw"
-        try {
+        for (attempt in 0..2) {
+            kyberSlot()
             val text = try {
                 request(url, headers = mapOf("X-Client-Id" to "tokenarb-android"))
             } catch (e: HttpError) {
                 val err = try { JSONObject(e.body) } catch (x: Exception) { null }
                 val code = err?.optInt("code", -1) ?: -1
                 if (code in NO_ROUTE_CODES) throw NoRouteException("KyberSwap $code: ${err?.optString("message")}")
+                if ((e.status == 429 || e.status >= 500) && attempt < 2) {
+                    Thread.sleep(1_000L * (attempt + 1))
+                    continue
+                }
                 throw RuntimeException("KyberSwap HTTP ${e.status}: ${err?.optString("message") ?: e.body.take(120)}")
             }
             val body = JSONObject(text)
@@ -166,8 +241,7 @@ object Api {
             val gas = rs.optString("gasUsd", "0").toDoubleOrNull() ?: 0.0
             val l1 = rs.optString("l1FeeUsd", "0").toDoubleOrNull() ?: 0.0
             return DexQuote(amountIn, out, gas + l1)
-        } finally {
-            lastKyber = System.currentTimeMillis()
         }
+        throw RuntimeException("KyberSwap: troppi tentativi")
     }
 }
