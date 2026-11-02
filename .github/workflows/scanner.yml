@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "scan · tokens = pool DEX · feeds = confronto feed · probe = verifica fonti Robinhood"
+        description: "scan · tokens · feeds · probe = fonti Robinhood · skipped = token senza pool"
         type: choice
-        options: [scan, tokens, feeds, probe]
+        options: [scan, tokens, feeds, probe, skipped]
         default: scan
 
 concurrency:
@@ -62,6 +62,8 @@ jobs:
             python -m tokenarb feeds
           elif [ "$CMD" = "probe" ]; then
             python tools/probe.py
+          elif [ "$CMD" = "skipped" ]; then
+            python tools/probe_skipped.py
           else
             python -m tokenarb scan
           fi
