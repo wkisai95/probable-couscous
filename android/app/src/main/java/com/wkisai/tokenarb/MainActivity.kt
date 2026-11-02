@@ -171,7 +171,7 @@ class MainActivity : Activity() {
                 else -> append("Ultima scansione: $time (${out.durationSec} s) · Borsa ${Market.label(out.session)}\n")
             }
             if (out.feedInfo.isNotEmpty()) append("Prezzi pool: ${out.feedInfo} · ")
-            append("${out.tokensFound} token Coinbase · ${out.opportunities.size} con liquidità\n")
+            append("${out.tokensFound} stock token · ${out.opportunities.size} con pool\n")
             if (s.buyOnly) {
                 append("${shown.size - pending} da comprare con profitto")
                 if (pending > 0) append(" · $pending in verifica on-chain")
@@ -180,7 +180,7 @@ class MainActivity : Activity() {
                     val closest = out.opportunities.minByOrNull { it.gapBps }
                     append("\nNessun token conviene comprarlo adesso.")
                     if (closest != null && closest.gapBps < 0) {
-                        append(" Il più scontato è ${closest.symbol} (${signed(closest.gapBps)} bps), ma non copre i costi.")
+                        append(" Il più scontato è ${closest.label} (${signed(closest.gapBps)} bps), ma non copre i costi.")
                     } else {
                         append(" Tutti i token costano quanto o più che in Borsa.")
                     }
@@ -275,11 +275,14 @@ class MainActivity : Activity() {
             !o.verified -> Color.parseColor("#1F4FB8")
             else -> Color.DKGRAY
         }
-        c.addView(header((if (o.actionable) "⚡ " else "") + o.symbol, right, rightColor))
+        c.addView(header((if (o.actionable) "⚡ " else "") + o.label, right, rightColor))
         c.addView(body(buildString {
             if (o.gapBps < 0) append("Sconto ${(-o.gapBps).toInt()} bps sulla Borsa · ")
             else append("Gap ${signed(o.gapBps)} bps · ")
             append("Borsa ${Notifier.px(o.fairPrice)} · ${Notifier.dexText(o)}")
+            append("\n${o.chain.label}")
+            o.dex?.let { append(" · $it") }
+            o.liquidityUsd?.let { append(" · liq ${Notifier.usd0(it)}") }
             if (b != null) {
                 append("\n${Notifier.directionLabel(b.direction)} · size ${Notifier.usd0(b.notionalUsd)} (${b.netBps.toInt()} bps)")
             }
@@ -288,8 +291,7 @@ class MainActivity : Activity() {
         val details = body(buildString {
             append("Prezzo di Borsa: ${o.refSource} (${o.refAgeMin.toInt()} min fa)")
             o.chainlink?.let { append(" · Chainlink ${Notifier.px(it)}") }
-            o.poolPrice?.let { append("\nPool ${o.dex ?: ""}: ${Notifier.px(it)}") }
-            o.liquidityUsd?.let { append(" · liquidità ${Notifier.usd0(it)}") }
+            o.poolPrice?.let { append("\nPrezzo nella pool: ${Notifier.px(it)}") }
             if (b != null) {
                 append("\nPrezzo medio on-chain ${Notifier.px(b.execPrice)} · token ${Notifier.qty(b.tokens)}")
                 append("\nLordo ${Notifier.usd(b.grossUsd)} − costi ${Notifier.usd(b.costsUsd)} = netto ${Notifier.usd(b.netUsd)}")
@@ -319,7 +321,8 @@ class MainActivity : Activity() {
             }
         }
         c.setOnLongClickListener {
-            val url = o.pair?.let { "https://dexscreener.com/base/$it" } ?: "https://basescan.org/token/${o.address}"
+            val url = o.pair?.let { "https://dexscreener.com/${o.chain.dexscreener}/$it" }
+                ?: (o.chain.explorerToken + o.address)
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
             true
         }
@@ -342,7 +345,7 @@ class MainActivity : Activity() {
         val sellable = st != null && st.fraction >= minF
         val c = box(if (sellable) "#E3F6E8" else "#EEF3FF")
         val right = if (sellable && st != null) "vendi il ${(st.fraction * 100).roundToInt()}%" else "in attesa"
-        c.addView(header("💼 ${p.symbol}", right,
+        c.addView(header("💼 ${p.label}", right,
             if (sellable) Color.parseColor("#0A7A35") else Color.parseColor("#1F4FB8")))
         c.addView(body(buildString {
             append("Comprati ${Notifier.usd0(p.usd)} a ${Notifier.px(p.entryPrice)} · ${Notifier.qty(p.tokens)} token")
@@ -410,7 +413,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(8), 0, 0)
         })
         AlertDialog.Builder(this)
-            .setTitle("Ho comprato ${o.symbol}")
+            .setTitle("Ho comprato ${o.label}")
             .setView(form)
             .setPositiveButton("Salva") { _, _ ->
                 val usd = parseNumber(usdIn.text.toString())
@@ -420,7 +423,7 @@ class MainActivity : Activity() {
                 } else {
                     Store.addPosition(this, Position(
                         UUID.randomUUID().toString(), o.address, o.symbol, o.ticker,
-                        usd, px, usd / px, System.currentTimeMillis(),
+                        usd, px, usd / px, System.currentTimeMillis(), o.chain,
                     ))
                     toast("Posizione salvata: ti avviso quando il gap si chiude")
                     render()
@@ -438,7 +441,7 @@ class MainActivity : Activity() {
         }
         val pctIn = field(form, "Percentuale della posizione venduta", String.format(Locale.US, "%.0f", def))
         AlertDialog.Builder(this)
-            .setTitle("Ho venduto ${p.symbol}")
+            .setTitle("Ho venduto ${p.label}")
             .setView(form)
             .setPositiveButton("Salva") { _, _ ->
                 val pct = parseNumber(pctIn.text.toString())
@@ -460,7 +463,7 @@ class MainActivity : Activity() {
 
     private fun deleteDialog(p: Position) {
         AlertDialog.Builder(this)
-            .setTitle("Eliminare ${p.symbol}?")
+            .setTitle("Eliminare ${p.label}?")
             .setMessage("La posizione non verrà più monitorata.")
             .setPositiveButton("Elimina") { _, _ ->
                 Store.updatePosition(this, p.id) { null }

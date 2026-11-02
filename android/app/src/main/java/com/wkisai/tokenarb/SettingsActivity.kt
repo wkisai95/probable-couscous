@@ -18,6 +18,8 @@ class SettingsActivity : Activity() {
     private lateinit var extended: Switch
     private lateinit var notif: Switch
     private lateinit var buyOnly: Switch
+    private lateinit var coinbase: Switch
+    private lateinit var robinhood: Switch
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -72,6 +74,18 @@ class SettingsActivity : Activity() {
             isChecked = s.buyOnly
             setPadding(0, dp(14), 0, 0)
         }
+        coinbase = Switch(this).apply {
+            text = "Stock token Coinbase (Base)"
+            isChecked = s.coinbase
+            setPadding(0, dp(14), 0, 0)
+        }
+        robinhood = Switch(this).apply {
+            text = "Stock token Robinhood (Robinhood Chain)"
+            isChecked = s.robinhood
+            setPadding(0, dp(14), 0, 0)
+        }
+        root.addView(coinbase)
+        root.addView(robinhood)
         root.addView(buyOnly)
         root.addView(extended)
         root.addView(notif)
@@ -88,6 +102,8 @@ class SettingsActivity : Activity() {
         ed.putBoolean("extendedTradable", extended.isChecked)
         ed.putBoolean("notifications", notif.isChecked)
         ed.putBoolean("buyOnly", buyOnly.isChecked)
+        ed.putBoolean("coinbase", coinbase.isChecked)
+        ed.putBoolean("robinhood", robinhood.isChecked)
         ed.apply()
         Toast.makeText(this, "Impostazioni salvate", Toast.LENGTH_SHORT).show()
         finish()

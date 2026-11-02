@@ -7,6 +7,7 @@ import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -17,14 +18,12 @@ class HttpError(val status: Int, val body: String) : RuntimeException("HTTP $sta
 /** L'aggregatore non trova liquidità per il token (KyberSwap 4008/4010/4011). */
 class NoRouteException(msg: String) : RuntimeException(msg)
 
-/** Chiamate HTTP alle fonti dati (Coinbase, Yahoo, Chainlink via RPC, KyberSwap). */
+/** Chiamate HTTP alle fonti dati: Coinbase, Robinhood, Yahoo, Chainlink, DexScreener, GeckoTerminal, KyberSwap. */
 object Api {
     private val NO_ROUTE_CODES = setOf(4008, 4010, 4011)
     private const val UA = "Mozilla/5.0 (Android) TokenArb/1.0"
-    const val USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    const val USDC_DECIMALS = 6
     private const val BASE_RPC = "https://mainnet.base.org"
-    private const val KYBER = "https://aggregator-api.kyberswap.com/base/api/v1/routes"
+    private const val ROBINHOOD_CHAIN_ID = 4663
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
@@ -52,9 +51,11 @@ object Api {
         }
     }
 
-    // ---------------------------------------------------------------- Coinbase
-    /** Tutti i token azionari Coinbase su Base (API ufficiale, paginata). */
-    fun listTokens(): List<CbToken> {
+    private fun num(s: String?): Double? = s?.toDoubleOrNull()?.takeIf { it.isFinite() }
+
+    // ---------------------------------------------------------------- elenchi token
+    /** Tutti gli stock token Coinbase su Base (API ufficiale, paginata). */
+    fun listCoinbaseTokens(): List<CbToken> {
         val out = mutableListOf<CbToken>()
         var pageToken: String? = null
         repeat(50) {
@@ -72,9 +73,10 @@ object Api {
                     ticker = if (sym.endsWith("c")) sym.dropLast(1) else sym,
                     name = t.optString("name", sym),
                     decimals = t.optString("decimals", "18").toIntOrNull() ?: 18,
-                    multiplier = t.optString("multiplier", "1").toDoubleOrNull()?.takeIf { it > 0 } ?: 1.0,
+                    multiplier = num(t.optString("multiplier", "1"))?.takeIf { it > 0 } ?: 1.0,
                     pausedFeatures = if (paused == null) emptyList()
                     else (0 until paused.length()).map { paused.optInt(it) },
+                    chain = Chain.BASE,
                 )
             }
             pageToken = o.optString("next_page_token", "").ifEmpty { null }
@@ -83,8 +85,61 @@ object Api {
         return out
     }
 
-    // ---------------------------------------------------------------- Yahoo
-    /** Ultimo prezzo a 1 minuto, pre/after-market inclusi. Prezzo per azione. */
+    /** Stock token Robinhood attivi su Robinhood Chain (API ufficiale /rhj/assets, 18 decimali). */
+    fun listRobinhoodTokens(): List<CbToken> {
+        val o = JSONObject(request("https://api.robinhood.com/rhj/assets"))
+        val arr = o.optJSONArray("assets") ?: JSONArray()
+        val out = mutableListOf<CbToken>()
+        for (i in 0 until arr.length()) {
+            val a = arr.getJSONObject(i)
+            if (a.optString("status") != "ASSET_STATUS_ACTIVE") continue
+            val sym = a.optString("tokenSymbol")
+            if (sym.isEmpty()) continue
+            val deps = a.optJSONArray("deployments") ?: JSONArray()
+            var address: String? = null
+            for (j in 0 until deps.length()) {
+                val d = deps.getJSONObject(j)
+                if (d.optInt("chainId") == ROBINHOOD_CHAIN_ID) address = d.optString("contractAddress")
+            }
+            if (address.isNullOrEmpty()) continue
+            out += CbToken(
+                address = address,
+                symbol = sym,
+                ticker = sym,
+                name = a.optString("tokenName", sym),
+                decimals = 18,
+                multiplier = num(a.optString("currentMultiplier"))?.takeIf { it > 0 } ?: 1.0,
+                chain = Chain.ROBINHOOD,
+            )
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- prezzi di Borsa
+    /**
+     * Bid/ask del titolo sottostante per tutti gli stock Robinhood in una sola richiesta (/rhj/prices).
+     * Prezzo per azione (non moltiplicato). -> (quotazioni per ticker, ticker sospesi)
+     */
+    fun robinhoodQuotes(): Pair<Map<String, RefQuote>, Set<String>> {
+        val o = JSONObject(request("https://api.robinhood.com/rhj/prices"))
+        val arr = o.optJSONArray("quotes") ?: JSONArray()
+        val out = mutableMapOf<String, RefQuote>()
+        val halted = mutableSetOf<String>()
+        val now = System.currentTimeMillis()
+        for (i in 0 until arr.length()) {
+            val q = arr.getJSONObject(i)
+            val sym = q.optString("tokenSymbol")
+            val bid = num(q.optString("bid")) ?: continue
+            val ask = num(q.optString("ask")) ?: continue
+            if (sym.isEmpty() || bid <= 0 || ask <= 0) continue
+            val ts = try { Instant.parse(q.optString("generatedAt")).toEpochMilli() } catch (e: Exception) { now }
+            out[sym] = RefQuote(sym, (bid + ask) / 2, ts, "robinhood")
+            if (q.optBoolean("isTradingHalt")) halted += sym
+        }
+        return Pair(out, halted)
+    }
+
+    /** Ultimo prezzo a 1 minuto da Yahoo, pre/after-market inclusi (riserva per i titoli non coperti). */
     fun yahoo(ticker: String, yahooSymbol: String): RefQuote? {
         for (range in listOf("1d", "5d")) {
             val url = "https://query1.finance.yahoo.com/v8/finance/chart/${enc(yahooSymbol)}" +
@@ -97,21 +152,23 @@ object Api {
             if (ts != null && closes != null) {
                 for (i in minOf(ts.length(), closes.length()) - 1 downTo 0) {
                     if (!closes.isNull(i)) {
-                        return RefQuote(ticker, closes.getDouble(i), ts.getLong(i) * 1000, "yahoo")
+                        val px = closes.getDouble(i)
+                        if (px > 0 && px.isFinite()) return RefQuote(ticker, px, ts.getLong(i) * 1000, "yahoo")
                     }
                 }
             }
             val meta = res.optJSONObject("meta")
             if (meta != null && meta.has("regularMarketPrice")) {
-                return RefQuote(ticker, meta.getDouble("regularMarketPrice"),
-                    meta.optLong("regularMarketTime") * 1000, "yahoo")
+                val px = meta.getDouble("regularMarketPrice")
+                if (px > 0 && px.isFinite()) {
+                    return RefQuote(ticker, px, meta.optLong("regularMarketTime") * 1000, "yahoo")
+                }
             }
         }
         return null
     }
 
-    // ---------------------------------------------------------------- Chainlink
-    /** latestRoundData() sui feed "Base Tokenized Equities": prezzo per token, 8 decimali. */
+    /** latestRoundData() sui feed Chainlink "Base Tokenized Equities": prezzo per token, 8 decimali. */
     fun chainlink(feeds: Map<String, String>): Map<String, RefQuote> {
         if (feeds.isEmpty()) return emptyMap()
         val keys = feeds.keys.toList()
@@ -134,28 +191,26 @@ object Api {
             var answer = BigInteger(words[1], 16)
             if (answer.testBit(255)) answer = answer.subtract(BigInteger.ONE.shiftLeft(256))
             val updated = BigInteger(words[3], 16).toLong() * 1000
+            val price = answer.toDouble() / 1e8
+            if (price <= 0) continue
             val t = keys[r.getInt("id")]
-            out[t] = RefQuote(t, answer.toDouble() / 1e8, updated, "chainlink", perToken = true)
+            out[t] = RefQuote(t, price, updated, "chainlink", perToken = true)
         }
         return out
     }
 
     // ---------------------------------------------------------------- DexScreener
-    private const val DEXSCREENER = "https://api.dexscreener.com/tokens/v1/base/"
-    private val USDC_LC = USDC.lowercase()
-
-    private fun isAero(p: PoolPrice) = p.dex.lowercase().contains("aero")
-
-    /** true se la pool [x] è preferibile a [y]: prima Aero, poi la più liquida. */
-    private fun better(x: PoolPrice, y: PoolPrice): Boolean =
-        if (isAero(x) != isAero(y)) isAero(x) else x.liquidityUsd > y.liquidityUsd
+    private fun addPool(out: ConcurrentHashMap<String, List<PoolPrice>>, token: String, p: PoolPrice) {
+        out.compute(token) { _, v -> (v ?: emptyList()) + p }
+    }
 
     /**
-     * Prezzo di ogni token nella sua pool token/USDC (Aero preferita) da DexScreener.
-     * Richieste parallele da 30 indirizzi: ~0,2 s per tutti i token. -> (prezzi, richieste fallite)
+     * Pool principale di ogni token da DexScreener (una per token), con qualsiasi controvaluta
+     * (USDC, USDG, WETH, …): il prezzo è già in USD. Richieste parallele da 30 indirizzi.
+     * -> (pool per indirizzo in minuscolo, richieste fallite)
      */
-    fun dexscreener(addresses: List<String>): Pair<Map<String, PoolPrice>, Int> {
-        val out = ConcurrentHashMap<String, PoolPrice>()
+    fun dexscreener(chain: Chain, addresses: List<String>): Pair<Map<String, List<PoolPrice>>, Int> {
+        val out = ConcurrentHashMap<String, List<PoolPrice>>()
         val failed = AtomicInteger(0)
         val chunks = addresses.chunked(30)
         if (chunks.isEmpty()) return Pair(out, 0)
@@ -164,7 +219,7 @@ object Api {
             for (chunk in chunks) {
                 pool.execute {
                     try {
-                        val url = DEXSCREENER + chunk.joinToString(",")
+                        val url = "https://api.dexscreener.com/tokens/v1/${chain.dexscreener}/" + chunk.joinToString(",")
                         val text = try {
                             request(url)
                         } catch (e: HttpError) {
@@ -172,7 +227,7 @@ object Api {
                             Thread.sleep(1_000)
                             request(url)
                         }
-                        parseDexScreener(JSONArray(text), chunk.map { it.lowercase() }.toSet(), out)
+                        parseDexScreener(chain, JSONArray(text), chunk.map { it.lowercase() }.toSet(), out)
                     } catch (e: Exception) {
                         failed.incrementAndGet()
                     }
@@ -185,28 +240,29 @@ object Api {
         return Pair(out, failed.get())
     }
 
-    private fun parseDexScreener(arr: JSONArray, wanted: Set<String>, out: ConcurrentHashMap<String, PoolPrice>) {
+    private fun parseDexScreener(chain: Chain, arr: JSONArray, wanted: Set<String>,
+                                 out: ConcurrentHashMap<String, List<PoolPrice>>) {
         for (i in 0 until arr.length()) {
             val p = arr.optJSONObject(i) ?: continue
-            if (p.optString("chainId") != "base") continue
-            val base = p.optJSONObject("baseToken")?.optString("address")?.lowercase() ?: continue
-            val quote = p.optJSONObject("quoteToken")?.optString("address")?.lowercase() ?: continue
+            if (p.optString("chainId") != chain.dexscreener) continue
+            val baseTok = p.optJSONObject("baseToken") ?: continue
+            val quoteTok = p.optJSONObject("quoteToken") ?: continue
+            val base = baseTok.optString("address").lowercase()
+            val quote = quoteTok.optString("address").lowercase()
             val tokenIsBase = base in wanted
             if (!tokenIsBase && quote !in wanted) continue
             val token = if (tokenIsBase) base else quote
-            val other = if (tokenIsBase) quote else base
-            if (other != USDC_LC) continue
-            val usd = p.optString("priceUsd").toDoubleOrNull() ?: continue
-            val native = p.optString("priceNative").toDoubleOrNull() ?: continue
+            val otherSym = if (tokenIsBase) quoteTok.optString("symbol") else baseTok.optString("symbol")
+            val usd = num(p.optString("priceUsd")) ?: continue
+            val native = num(p.optString("priceNative")) ?: continue
             // priceUsd e priceNative si riferiscono al token base della pool
             val px = if (tokenIsBase) usd else if (native > 0) usd / native else 0.0
             if (!(px > 0) || !px.isFinite()) continue
             val liq = p.optJSONObject("liquidity")?.optDouble("usd", 0.0)?.takeIf { it.isFinite() } ?: 0.0
             val labels = p.optJSONArray("labels")
             val labelText = if (labels == null) "" else (0 until labels.length()).joinToString(" ") { labels.optString(it) }
-            val dex = (p.optString("dexId", "?") + " " + labelText).trim()
-            val cand = PoolPrice(px, liq, dex, p.optString("pairAddress").ifEmpty { null })
-            out.merge(token, cand) { a, b -> if (better(b, a)) b else a }
+            val dex = "${p.optString("dexId", "?")} $labelText".trim() + if (otherSym.isNotEmpty()) " · $otherSym" else ""
+            addPool(out, token, PoolPrice(px, liq, dex, p.optString("pairAddress").ifEmpty { null }))
         }
     }
 
@@ -215,17 +271,17 @@ object Api {
     private const val GECKO_GAP_MS = 1_200L
 
     /**
-     * Pool più liquida di ogni token e liquidità totale da GeckoTerminal, a blocchi di 30 indirizzi.
-     * Richieste in sequenza con pausa e attese crescenti se il servizio limita la frequenza.
-     * Completa DexScreener: trova le pool che non indicizza. -> (prezzi, richieste fallite)
+     * Tutte le pool principali di ogni token da GeckoTerminal, ognuna con il proprio prezzo:
+     * trova le pool piccole che DexScreener non riporta. Richieste in sequenza, a blocchi di 30,
+     * con pausa e attese crescenti se il servizio limita la frequenza. -> (pool per indirizzo, richieste fallite)
      */
-    fun gecko(addresses: List<String>): Pair<Map<String, PoolPrice>, Int> {
-        val out = ConcurrentHashMap<String, PoolPrice>()
+    fun gecko(chain: Chain, addresses: List<String>): Pair<Map<String, List<PoolPrice>>, Int> {
+        val out = ConcurrentHashMap<String, List<PoolPrice>>()
         var failed = 0
         val headers = mapOf("Accept" to "application/json;version=20230302")
         for ((i, chunk) in addresses.chunked(30).withIndex()) {
             if (i > 0) Thread.sleep(GECKO_GAP_MS)
-            val url = "https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/" +
+            val url = "https://api.geckoterminal.com/api/v2/networks/${chain.gecko}/tokens/multi/" +
                 chunk.joinToString(",") + "?include=top_pools"
             var body: String? = null
             for (attempt in 0..3) {
@@ -253,7 +309,7 @@ object Api {
         return Pair(out, failed)
     }
 
-    private fun parseGecko(o: JSONObject, out: ConcurrentHashMap<String, PoolPrice>) {
+    private fun parseGecko(o: JSONObject, out: ConcurrentHashMap<String, List<PoolPrice>>) {
         val pools = mutableMapOf<String, JSONObject>()
         val inc = o.optJSONArray("included") ?: JSONArray()
         for (i in 0 until inc.length()) {
@@ -268,33 +324,20 @@ object Api {
             if (addr.isEmpty()) continue
             val refs = t.optJSONObject("relationships")?.optJSONObject("top_pools")
                 ?.optJSONArray("data") ?: JSONArray()
-            var reserve = 0.0
-            var top: JSONObject? = null
-            var topReserve = -1.0
             for (j in 0 until refs.length()) {
                 val p = pools[refs.getJSONObject(j).optString("id")] ?: continue
-                val r = p.optJSONObject("attributes")?.optString("reserve_in_usd")?.toDoubleOrNull() ?: 0.0
-                reserve += r
-                if (r > topReserve) {
-                    topReserve = r
-                    top = p
-                }
+                val pa = p.optJSONObject("attributes") ?: continue
+                val rel = p.optJSONObject("relationships")
+                val baseId = rel?.optJSONObject("base_token")?.optJSONObject("data")?.optString("id")?.lowercase() ?: ""
+                val px = if (baseId.endsWith(addr)) num(pa.optString("base_token_price_usd"))
+                else num(pa.optString("quote_token_price_usd"))
+                if (px == null || !(px > 0)) continue
+                val liq = num(pa.optString("reserve_in_usd")) ?: 0.0
+                val dexId = rel?.optJSONObject("dex")?.optJSONObject("data")?.optString("id") ?: "?"
+                val name = pa.optString("name")
+                val label = if (name.isNotEmpty()) "$dexId · $name" else dexId
+                addPool(out, addr, PoolPrice(px, liq, label, pa.optString("address").ifEmpty { null }))
             }
-            // prezzo del token nella sua pool principale; in mancanza, il prezzo medio del token
-            var price: Double? = null
-            if (top != null) {
-                val pa = top.optJSONObject("attributes")
-                val baseId = top.optJSONObject("relationships")?.optJSONObject("base_token")
-                    ?.optJSONObject("data")?.optString("id")?.lowercase() ?: ""
-                price = if (baseId.endsWith(addr)) pa?.optString("base_token_price_usd")?.toDoubleOrNull()
-                else pa?.optString("quote_token_price_usd")?.toDoubleOrNull()
-            }
-            if (price == null || !(price > 0)) price = a.optString("price_usd").toDoubleOrNull()
-            if (price == null || !(price > 0) || !price.isFinite()) continue
-            val dexId = top?.optJSONObject("relationships")?.optJSONObject("dex")
-                ?.optJSONObject("data")?.optString("id") ?: "geckoterminal"
-            val pairAddr = top?.optJSONObject("attributes")?.optString("address")
-            out[addr] = PoolPrice(price, reserve, dexId, pairAddr)
         }
     }
 
@@ -314,10 +357,12 @@ object Api {
         if (wait > 0) Thread.sleep(wait)
     }
 
-    /** Quota eseguibile on-chain su Base (Aero, Aerodrome, Uniswap, ...): fee pool e slippage inclusi. */
-    fun quote(tokenIn: String, decIn: Int, tokenOut: String, decOut: Int, amountIn: Double): DexQuote {
+    /** Quota eseguibile on-chain (tutte le pool della chain): fee, slippage e gas inclusi. */
+    fun quote(chain: Chain, tokenIn: String, decIn: Int, tokenOut: String, decOut: Int, amountIn: Double): DexQuote {
         val raw = BigDecimal.valueOf(amountIn).movePointRight(decIn).toBigInteger()
-        val url = "$KYBER?tokenIn=$tokenIn&tokenOut=$tokenOut&amountIn=$raw"
+        if (raw.signum() <= 0) throw RuntimeException("importo troppo piccolo")
+        val url = "https://aggregator-api.kyberswap.com/${chain.kyber}/api/v1/routes" +
+            "?tokenIn=$tokenIn&tokenOut=$tokenOut&amountIn=$raw"
         for (attempt in 0..2) {
             kyberSlot()
             val text = try {
@@ -340,8 +385,8 @@ object Api {
             }
             val rs = body.getJSONObject("data").getJSONObject("routeSummary")
             val out = BigDecimal(rs.getString("amountOut")).movePointLeft(decOut).toDouble()
-            val gas = rs.optString("gasUsd", "0").toDoubleOrNull() ?: 0.0
-            val l1 = rs.optString("l1FeeUsd", "0").toDoubleOrNull() ?: 0.0
+            val gas = num(rs.optString("gasUsd", "0")) ?: 0.0
+            val l1 = num(rs.optString("l1FeeUsd", "0")) ?: 0.0
             return DexQuote(amountIn, out, gas + l1)
         }
         throw RuntimeException("KyberSwap: troppi tentativi")

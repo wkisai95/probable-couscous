@@ -6,31 +6,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
-/** Impostazioni modificabili dall'app. */
-data class Settings(
-    val maxNotional: Double = 25_000.0,
-    val tradeSize: Double = 1_000.0,
-    val minProfit: Double = 20.0,
-    val minBps: Double = 30.0,
-    val feePerShare: Double = 0.005,
-    val feeBps: Double = 0.0,
-    val fixedCost: Double = 0.0,
-    val halfSpreadRegular: Double = 2.0,
-    val halfSpreadExtended: Double = 15.0,
-    val maxRefAgeMin: Double = 20.0,
-    val cooldownMin: Double = 60.0,
-    val closeTolBps: Double = 10.0,    // gap considerato chiuso entro questi bps
-    val minExitPct: Double = 10.0,     // avvisa se si può vendere almeno questa % della posizione
-    val extendedTradable: Boolean = false,
-    val notifications: Boolean = true,
-    val buyOnly: Boolean = true,       // solo arbitraggi in cui conviene comprare il token
-    val tickers: String = "",          // vuoto = tutti
-    val exclude: String = "",
-) {
-    fun tickerSet() = tickers.split(",", " ").map { it.trim().uppercase() }.filter { it.isNotEmpty() }.toSet()
-    fun excludeSet() = exclude.split(",", " ").map { it.trim().uppercase() }.filter { it.isNotEmpty() }.toSet()
-}
-
 object Store {
     private const val PREFS = "tokenarb"
     const val KEY_RESULTS = "last_scan"
@@ -65,6 +40,8 @@ object Store {
             extendedTradable = p.getBoolean("extendedTradable", d.extendedTradable),
             notifications = p.getBoolean("notifications", d.notifications),
             buyOnly = p.getBoolean("buyOnly", d.buyOnly),
+            coinbase = p.getBoolean("coinbase", d.coinbase),
+            robinhood = p.getBoolean("robinhood", d.robinhood),
             tickers = p.getString("tickers", d.tickers) ?: "",
             exclude = p.getString("exclude", d.exclude) ?: "",
         )

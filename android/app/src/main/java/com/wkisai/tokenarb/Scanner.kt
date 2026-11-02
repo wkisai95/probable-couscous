@@ -12,28 +12,29 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Scansione a ogni giro:
- *  1. DexScreener (pool token/USDC, Aero preferita, ~0,2 s): confronto con Wall Street e
- *     arbitraggi subito a schermo; parte la verifica on-chain (KyberSwap) dei candidati;
- *  2. GeckoTerminal subito dopo: aggiunge i token che DexScreener non indicizza e sostituisce
- *     il prezzo quando trova una pool molto più liquida; i nuovi candidati vanno in verifica;
- *  3. controllo delle posizioni con i prezzi migliori delle due fonti;
- *  4. fine della verifica on-chain: prezzo eseguibile, size ottimale e profitto netto.
+ * Scansione degli stock token Coinbase (Base) e Robinhood (Robinhood Chain) contro Wall Street.
+ *  1. prezzi di Borsa: bid/ask Robinhood per tutti i titoli in una richiesta (riserva: Yahoo);
+ *  2. DexScreener (pool principale di ogni token, ~1 s): confronto e arbitraggi subito a schermo,
+ *     poi verifica on-chain (KyberSwap) dei candidati, i meno liquidi per primi;
+ *  3. GeckoTerminal subito dopo: tutte le pool principali di ogni token, comprese le piccole,
+ *     dove si trovano i prezzi sbagliati; i nuovi candidati vanno in verifica;
+ *  4. controllo delle posizioni e fine della verifica on-chain.
+ * Lo sconto di un token è quello della sua pool più economica (per comprare) o più cara (per vendere).
  */
 object Scanner {
-    private val LADDER = listOf(500.0, 1500.0, 4000.0, 10000.0, 25000.0, 50000.0)
-    private const val PROBE_USD = 100.0
-    private const val MIN_POOL_USD = 1_000.0
+    private val LADDER = listOf(10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1500.0, 4000.0, 10000.0, 25000.0, 50000.0)
+    private const val MIN_POOL_USD = 20.0
     private const val CHAINLINK_DIVERGENCE_BPS = 100.0
-    const val MAX_PLAUSIBLE_GAP_BPS = 2_500.0
+    const val MAX_PLAUSIBLE_GAP_BPS = 5_000.0
     const val NO_ROUTE_TTL_MS = 6 * 3_600_000L
     private const val TOKENS_TTL_MS = 3_600_000L
-    private const val YAHOO_THREADS = 12
+    private const val YAHOO_THREADS = 8
     private const val KYBER_THREADS = 6
 
-    /** Feed Chainlink "Base Tokenized Equities" (prezzo per token). */
+    /** Feed Chainlink "Base Tokenized Equities" (prezzo per token Coinbase). */
     private val FEEDS = mapOf(
         "AAPL" to "0x787f13dEa48Db0897CbCDD985de77809D837F988",
         "AMZN" to "0x06A8E4b3aBB3B7543d8396FB2B763d22820cB295",
@@ -54,12 +55,17 @@ object Scanner {
         val noRoute: MutableMap<String, Long>,
     )
 
-    private class Candidate(val token: CbToken, val fair: Double, val gap: Double, val base: Opportunity)
+    private class Candidate(
+        val token: CbToken, val fair: Double, val gap: Double, val base: Opportunity,
+        val poolLiq: Double, val totalLiq: Double, val halted: Boolean,
+    )
 
     private val running = AtomicBoolean(false)
     val isRunning: Boolean get() = running.get()
 
     fun yahooSymbol(ticker: String) = ticker.replace('.', '-').replace('/', '-')
+
+    private fun px(v: Double) = String.format(Locale.ITALY, "%.2f", v)
 
     /** Esegue una scansione; restituisce null se ce n'è già una in corso. */
     fun runExclusive(
@@ -94,34 +100,71 @@ object Scanner {
             synchronized(feed) { feed.joinToString(" · ") },
         )
 
-        // ---- elenco token (in cache per un'ora)
-        onUpdate(outcome(true, "Elenco token Coinbase…"))
-        val allTokens = cachedTokens(st, started)
-        total = allTokens.size
+        // ---- elenco token delle chain attive (in cache per un'ora)
+        onUpdate(outcome(true, "Elenco token…"))
+        val posChains = positions.map { it.chain }.toSet()
+        val chains = (s.chains() + posChains).distinct()
+        val allTokens = cachedTokens(st, started, chains, notes)
+        val enabled = s.chains().toSet()
+        total = allTokens.count { it.chain in enabled }
         val byAddr = allTokens.associateBy { it.address.lowercase() }
         val wanted = s.tickerSet()
         val excluded = s.excludeSet()
         val screenAddr = allTokens.filter {
-            (wanted.isEmpty() || it.ticker.uppercase() in wanted) && it.ticker.uppercase() !in excluded
+            it.chain in enabled && (wanted.isEmpty() || it.ticker.uppercase() in wanted) &&
+                it.ticker.uppercase() !in excluded
         }.map { it.address.lowercase() }.toSet()
         val posAddr = positions.map { it.address.lowercase() }.toSet()
         val scope = allTokens.filter { val a = it.address.lowercase(); a in screenAddr || a in posAddr }
 
-        // ---- 1. DexScreener
-        onUpdate(outcome(true, "Prezzi delle pool Aero (DexScreener)…"))
+        // ---- prezzi di Borsa Robinhood (una richiesta, in parallelo a DexScreener)
+        val refExec = Executors.newSingleThreadExecutor()
+        val rhFuture = refExec.submit<Pair<Map<String, RefQuote>, Set<String>>> { Api.robinhoodQuotes() }
+        refExec.shutdown()
+
+        // ---- 1. DexScreener: pool principale di ogni token
+        onUpdate(outcome(true, "Prezzi delle pool (DexScreener)…"))
         val t0 = System.currentTimeMillis()
-        val (dsPrices, dsFailed) = Api.dexscreener(scope.map { it.address })
+        val dsPools = mutableMapOf<String, List<PoolPrice>>()
+        var dsFailed = 0
+        for (chain in chains) {
+            val (m, f) = Api.dexscreener(chain, scope.filter { it.chain == chain }.map { it.address })
+            dsPools.putAll(m)
+            dsFailed += f
+        }
         feed += "DexScreener ${System.currentTimeMillis() - t0} ms"
         if (dsFailed > 0) notes += "DexScreener: $dsFailed richieste fallite"
 
-        // ---- 2. GeckoTerminal parte subito dopo, in parallelo al resto
+        // ---- 2. GeckoTerminal parte subito dopo, in background
         val gtStart = System.currentTimeMillis()
         val gtExec = Executors.newSingleThreadExecutor()
-        val gtFuture = gtExec.submit<Pair<Map<String, PoolPrice>, Int>> { Api.gecko(scope.map { it.address }) }
+        val gtFuture = gtExec.submit<Pair<Map<String, List<PoolPrice>>, Int>> {
+            val all = mutableMapOf<String, List<PoolPrice>>()
+            var failed = 0
+            for (chain in chains) {
+                val (m, f) = Api.gecko(chain, scope.filter { it.chain == chain }.map { it.address })
+                all.putAll(m)
+                failed += f
+            }
+            Pair(all, failed)
+        }
         gtExec.shutdown()
 
-        val ws = ConcurrentHashMap<String, RefQuote>()
-        val priceBy = ConcurrentHashMap<String, PoolPrice>()
+        val (rhQuotes, halted) = try {
+            rhFuture.get(30, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            notes += "Prezzi Robinhood non disponibili: uso Yahoo"
+            Pair(emptyMap<String, RefQuote>(), emptySet<String>())
+        }
+        if (rhQuotes.isNotEmpty()) feed += "Borsa: Robinhood ${rhQuotes.size} titoli"
+        val ws = ConcurrentHashMap<String, RefQuote>(rhQuotes)
+        val cl = try {
+            Api.chainlink(FEEDS.filterKeys { k -> scope.any { it.chain == Chain.BASE && it.ticker == k } })
+        } catch (e: Exception) {
+            emptyMap()
+        }
+
+        val poolsBy = ConcurrentHashMap<String, List<PoolPrice>>()
         val fairBy = ConcurrentHashMap<String, Double>()
         val candidates = ConcurrentHashMap.newKeySet<String>()
         val noRef = Collections.synchronizedSet(mutableSetOf<String>())
@@ -155,38 +198,53 @@ object Scanner {
             }
         }
 
-        val cl = try {
-            Api.chainlink(FEEDS.filterKeys { k -> scope.any { it.ticker == k } })
-        } catch (e: Exception) {
-            emptyMap()
+        /** Prezzi Yahoo solo per i titoli che Robinhood non copre. */
+        fun fillReference(tokens: List<CbToken>) {
+            val missing = tokens.filter { !ws.containsKey(it.ticker) }
+            if (missing.isNotEmpty()) ws.putAll(fetchYahoo(missing))
         }
 
-        /** Confronto con Wall Street per un gruppo di token con i prezzi indicati. */
-        fun screen(tokens: List<CbToken>, prices: Map<String, PoolPrice>) {
+        /** Confronto con Wall Street: sconto sulla pool più economica, rincaro sulla più cara. */
+        fun screen(tokens: List<CbToken>, pools: Map<String, List<PoolPrice>>) {
+            val found = mutableListOf<Candidate>()
             for (t in tokens) {
                 val a = t.address.lowercase()
-                val pool = prices[a] ?: continue
-                priceBy[a] = pool
+                val list = pools[a]?.filter {
+                    it.priceUsd > 0 && it.priceUsd.isFinite() && (it.liquidityUsd >= MIN_POOL_USD || a in posAddr)
+                } ?: continue
+                if (list.isEmpty()) continue
+                poolsBy[a] = list
                 val w = ws[t.ticker]
-                val c = cl[t.ticker]
+                val c = if (t.chain == Chain.BASE) cl[t.ticker] else null
                 val fair = pickFair(t, w, c, started, s.maxRefAgeMin)
-                if (fair == null) {
-                    noRef += t.symbol
+                if (fair == null || !(fair.first > 0) || !fair.first.isFinite()) {
+                    noRef += t.label
                     continue
                 }
-                noRef -= t.symbol
+                noRef -= t.label
                 val (fairPx, src, age) = fair
                 fairBy[a] = fairPx
                 if (a !in screenAddr) continue
                 if (candidates.contains(a)) continue   // già in verifica on-chain: decide la verifica
-                val gap = (pool.priceUsd - fairPx) / fairPx * 1e4
+                val cheap = list.minBy { it.priceUsd }
+                val rich = list.maxBy { it.priceUsd }
+                val buyGap = (cheap.priceUsd - fairPx) / fairPx * 1e4
+                val sellGap = (rich.priceUsd - fairPx) / fairPx * 1e4
+                val useBuy = s.buyOnly || -buyGap >= sellGap
+                val pool = if (useBuy) cheap else rich
+                val gap = if (useBuy) buyGap else sellGap
+                val isHalted = t.ticker in halted
+                val extra = mutableListOf<String>()
+                if (isHalted) extra += "titolo sospeso in Borsa"
+                if (list.size > 1) extra += "${list.size} pool: prezzi da ${px(cheap.priceUsd)} a ${px(rich.priceUsd)}"
                 val base = Opportunity(
                     ticker = t.ticker, symbol = t.symbol, address = t.address, session = session,
                     fairPrice = fairPx, refSource = src, refAgeMin = age,
                     dexBuy = null, dexSell = null, poolPrice = pool.priceUsd, liquidityUsd = pool.liquidityUsd,
                     dex = pool.dex, pair = pool.pair, gapBps = gap, chainlink = c?.price,
                     best = null, fixed = null, actionable = false, verified = false,
-                    notes = baseNotes(t, session, tradable, age, s, w, c, started),
+                    notes = baseNotes(t, session, tradable, age, s, w, c, started) + extra,
+                    chain = t.chain,
                 )
                 val relevant = if (s.buyOnly) gap <= -prefilter else abs(gap) >= prefilter
                 if (!relevant) {
@@ -198,57 +256,58 @@ object Scanner {
                 } else {
                     candidates.add(a)
                     opps[a] = base
-                    verify(Candidate(t, fairPx, gap, base))
+                    found += Candidate(t, fairPx, gap, base, pool.liquidityUsd, list.sumOf { it.liquidityUsd }, isHalted)
                 }
             }
+            // i token meno liquidi per primi: è lì che i prezzi si scostano di più
+            found.sortedBy { it.poolLiq }.forEach { verify(it) }
         }
 
-        // ---- quadro con i prezzi DexScreener: subito a schermo
-        val dsTokens = scope.filter { t ->
-            val a = t.address.lowercase()
-            val p = dsPrices[a]
-            p != null && (p.liquidityUsd >= MIN_POOL_USD || a in posAddr)
-        }
-        onUpdate(outcome(true, "Prezzi Wall Street (${dsTokens.size} titoli)…"))
-        ws.putAll(fetchYahoo(dsTokens))
-        screen(dsTokens, dsPrices)
+        // ---- quadro con DexScreener: subito a schermo
+        val dsTokens = scope.filter { dsPools.containsKey(it.address.lowercase()) }
+        onUpdate(outcome(true, "Prezzi Wall Street…"))
+        fillReference(dsTokens)
+        screen(dsTokens, dsPools)
         emitProgress(force = true)
 
-        // ---- GeckoTerminal: completa e migliora i prezzi
+        // ---- GeckoTerminal: tutte le pool, comprese le più piccole
         val gt = try {
-            gtFuture.get(120, TimeUnit.SECONDS)
+            gtFuture.get(150, TimeUnit.SECONDS)
         } catch (e: Exception) {
             null
         }
         if (gt == null) {
-            notes += "GeckoTerminal non disponibile in questa scansione: alcuni token potrebbero mancare"
+            notes += "GeckoTerminal non disponibile in questa scansione: alcune pool potrebbero mancare"
         } else {
-            val (gtPrices, gtFailed) = gt
-            val sec = (System.currentTimeMillis() - gtStart) / 1000.0
-            feed += "GeckoTerminal " + String.format(Locale.ITALY, "%.1f s", sec)
+            val (gtPools, gtFailed) = gt
+            feed += "GeckoTerminal " + String.format(Locale.ITALY, "%.1f s", (System.currentTimeMillis() - gtStart) / 1000.0)
             if (gtFailed > 0) notes += "GeckoTerminal: $gtFailed richieste fallite"
-            // pool GeckoTerminal usata se DexScreener non ha il token o ha una pool molto meno liquida
-            val better = mutableMapOf<String, PoolPrice>()
+            // unione delle pool delle due fonti; si riesaminano i token con pool nuove
+            val merged = mutableMapOf<String, List<PoolPrice>>()
+            val changed = mutableListOf<CbToken>()
             for (t in scope) {
                 val a = t.address.lowercase()
-                val g = gtPrices[a] ?: continue
-                if (g.liquidityUsd < MIN_POOL_USD && a !in posAddr) continue
-                val d = dsPrices[a]
-                if (d == null || g.liquidityUsd > d.liquidityUsd * 2) better[a] = g
+                val g = gtPools[a] ?: continue
+                val d = dsPools[a] ?: emptyList()
+                val known = d.mapNotNull { it.pair?.lowercase() }.toSet()
+                val added = g.filter { it.pair == null || it.pair.lowercase() !in known }
+                if (added.isEmpty()) continue
+                merged[a] = d + added
+                changed += t
             }
-            val gtTokens = scope.filter { it.address.lowercase() in better }
-            val needWs = gtTokens.filter { !ws.containsKey(it.ticker) }
-            if (needWs.isNotEmpty()) ws.putAll(fetchYahoo(needWs))
-            screen(gtTokens, better)
+            if (changed.isNotEmpty()) {
+                fillReference(changed)
+                screen(changed, merged)
+            }
             emitProgress(force = true)
         }
 
-        // ---- posizioni, con i prezzi migliori delle due fonti
+        // ---- posizioni, con le pool di entrambe le fonti
         if (positions.isNotEmpty()) {
             onUpdate(outcome(true, "Controllo le tue posizioni…"))
             onPositions(positions.map { p ->
                 val a = p.address.lowercase()
-                checkPosition(p, byAddr[a], fairBy[a], priceBy[a], session, s, started)
+                checkPosition(p, byAddr[a], fairBy[a], poolsBy[a], session, s, started)
             })
         }
 
@@ -256,10 +315,10 @@ object Scanner {
         verifyExec.shutdown()
         verifyExec.awaitTermination(8, TimeUnit.MINUTES)
 
-        val skipped = screenAddr.count { !priceBy.containsKey(it) }
+        val skipped = screenAddr.count { !poolsBy.containsKey(it) }
         val missingRef = synchronized(noRef) { noRef.sorted() }
         if (missingRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${missingRef.joinToString(", ")}"
-        if (skipped > 0) notes += "Senza pool con liquidità su Base: $skipped token (saltati)"
+        if (skipped > 0) notes += "Senza pool con liquidità: $skipped token (saltati)"
         return outcome(false, "")
     }
 
@@ -267,6 +326,7 @@ object Scanner {
     private fun sizeCandidate(c: Candidate, s: Settings, session: String, tradable: Set<String>,
                               st: State, now: Long): Opportunity {
         val t = c.token
+        val chain = t.chain
         val fair = c.fair
         val costs = Sizing.Costs(
             s.feeBps, s.feePerShare,
@@ -274,15 +334,17 @@ object Scanner {
             s.fixedCost, t.multiplier,
         )
         val q = Sizing.QuoteFn { dir, amt ->
-            if (dir == Sizing.BUY) Api.quote(Api.USDC, Api.USDC_DECIMALS, t.address, t.decimals, amt)
-            else Api.quote(t.address, t.decimals, Api.USDC, Api.USDC_DECIMALS, amt)
+            if (dir == Sizing.BUY) Api.quote(chain, chain.stable, chain.stableDecimals, t.address, t.decimals, amt)
+            else Api.quote(chain, t.address, t.decimals, chain.stable, chain.stableDecimals, amt)
         }
+        // prova proporzionata alla pool: in una pool da $300 anche $100 sposterebbero il prezzo
+        val probeUsd = (c.poolLiq * 0.005).coerceIn(5.0, 100.0)
         val dir = if (c.gap < 0) Sizing.BUY else Sizing.SELL
         val px: Double = try {
             if (dir == Sizing.BUY) {
-                PROBE_USD / q.quote(Sizing.BUY, PROBE_USD).amountOut
+                probeUsd / q.quote(Sizing.BUY, probeUsd).amountOut
             } else {
-                val tk = PROBE_USD / fair
+                val tk = probeUsd / fair
                 q.quote(Sizing.SELL, tk).amountOut / tk
             }
         } catch (e: NoRouteException) {
@@ -299,10 +361,15 @@ object Scanner {
         val edge = Sizing.unitEdge(dir, buyPx ?: Double.MAX_VALUE, sellPx ?: 0.0, fair, costs)
         if (edge <= 0) {
             return c.base.copy(dexBuy = buyPx, dexSell = sellPx, verified = true,
-                notes = c.base.notes + "il prezzo eseguibile non copre i costi della copertura")
+                notes = c.base.notes + "il prezzo eseguibile (${px(px)}) non copre i costi della copertura")
         }
-        val (best, fixed) = Sizing.search(dir, fair, q, costs, LADDER, s.maxNotional, s.tradeSize)
-        val actionable = best != null && session in tradable && c.base.refAgeMin <= s.maxRefAgeMin &&
+        // scala di size adattata alla liquidità: mai oltre metà della liquidità totale del token
+        val cap = max(50.0, c.totalLiq * 0.5)
+        val maxN = min(s.maxNotional, cap)
+        val ladder = LADDER.filter { it <= maxN }
+        val fixedSize = s.tradeSize.takeIf { it <= maxN }
+        val (best, fixed) = Sizing.search(dir, fair, q, costs, ladder, maxN, fixedSize)
+        val actionable = best != null && !c.halted && session in tradable && c.base.refAgeMin <= s.maxRefAgeMin &&
             t.pausedFeatures.isEmpty() && best.netUsd >= s.minProfit && best.netBps >= s.minBps
         return c.base.copy(dexBuy = buyPx, dexSell = sellPx, best = best, fixed = fixed,
             actionable = actionable, verified = true)
@@ -312,25 +379,26 @@ object Scanner {
      * Quota della posizione vendibile chiudendo il gap: prezzo medio di vendita eseguibile
      * ≥ prezzo di Borsa × (1 − tolleranza). Si cerca la quota più alta a passi del 10%.
      */
-    private fun checkPosition(p: Position, t: CbToken?, fair: Double?, pool: PoolPrice?,
+    private fun checkPosition(p: Position, t: CbToken?, fair: Double?, pools: List<PoolPrice>?,
                               session: String, s: Settings, now: Long): PositionStatus {
+        val spot = pools?.maxOfOrNull { it.priceUsd }   // la pool che paga di più
         fun status(fraction: Double = 0.0, sellTokens: Double? = null, proceeds: Double? = null,
                    avg: Double? = null, pnl: Double? = null, note: String? = null) =
-            PositionStatus(p.id, now, fair, pool?.priceUsd, fraction, sellTokens, proceeds, avg, pnl, note)
+            PositionStatus(p.id, now, fair, spot, fraction, sellTokens, proceeds, avg, pnl, note)
 
-        if (t == null) return status(note = "token non più presente nell'elenco Coinbase")
+        if (t == null) return status(note = "token non più presente nell'elenco dell'emittente")
         if (fair == null) {
-            return status(note = if (pool == null) "prezzo on-chain non disponibile in questa scansione"
+            return status(note = if (pools == null) "prezzo on-chain non disponibile in questa scansione"
             else "prezzo di Borsa non disponibile")
         }
         if (p.tokens <= 0) return status(note = "posizione vuota")
         val target = fair * (1 - s.closeTolBps / 1e4)
         val closed = if (session != "regular") "Borsa ${Market.label(session)}: confronto con l'ultimo prezzo" else null
-        val spot = pool?.priceUsd
         if (spot != null && spot < target) {
             val gap = (spot - fair) / fair * 1e4
             return status(note = listOfNotNull("gap ancora aperto (${gap.toInt()} bps)", closed).joinToString(" · "))
         }
+        val chain = t.chain
         var lo = 0
         var hi = 10
         var bestK = 0
@@ -339,7 +407,7 @@ object Scanner {
             while (lo < hi) {
                 val mid = (lo + hi + 1) / 2
                 val amount = p.tokens * mid / 10.0
-                val qd = Api.quote(t.address, t.decimals, Api.USDC, Api.USDC_DECIMALS, amount)
+                val qd = Api.quote(chain, t.address, t.decimals, chain.stable, chain.stableDecimals, amount)
                 if (qd.amountOut / amount >= target) {
                     lo = mid
                     bestK = mid
@@ -370,19 +438,20 @@ object Scanner {
         if (t.pausedFeatures.isNotEmpty()) notes += "funzioni del contratto in pausa"
         if (w != null && c != null && (now - c.asOfMillis) / 60000.0 <= s.maxRefAgeMin) {
             val diff = (w.price * t.multiplier - c.price) / c.price * 1e4
-            if (abs(diff) > CHAINLINK_DIVERGENCE_BPS) notes += "Yahoo e Chainlink divergono di ${diff.toInt()} bps"
+            if (abs(diff) > CHAINLINK_DIVERGENCE_BPS) notes += "Borsa e Chainlink divergono di ${diff.toInt()} bps"
         }
         return notes
     }
 
+    /** Prima i segnali sopra soglia, poi il rendimento netto %, poi lo sconto. */
     private fun sortOpps(c: Collection<Opportunity>): List<Opportunity> = c.sortedWith(
         compareByDescending<Opportunity> { it.actionable }
-            .thenByDescending { it.best?.netUsd ?: Double.NEGATIVE_INFINITY }
+            .thenByDescending { o -> o.best?.takeIf { it.netUsd > 0 }?.netBps ?: Double.NEGATIVE_INFINITY }
             .thenByDescending { abs(it.gapBps) }
     )
 
-    /** Elenco token dall'API Coinbase, in cache per un'ora (se l'API non risponde usa la cache). */
-    private fun cachedTokens(st: State, now: Long): List<CbToken> {
+    /** Elenchi token di Coinbase e Robinhood, in cache per un'ora (se un'API non risponde usa la cache). */
+    private fun cachedTokens(st: State, now: Long, chains: List<Chain>, notes: MutableList<String>): List<CbToken> {
         val cached = st.tokensJson?.let { json ->
             try {
                 val arr = JSONArray(json)
@@ -390,16 +459,35 @@ object Scanner {
             } catch (e: Exception) {
                 null
             }
+        } ?: emptyList()
+        val fresh = now - st.tokensAt < TOKENS_TTL_MS
+        val out = mutableListOf<CbToken>()
+        var refreshed = false
+        for (chain in chains) {
+            val have = cached.filter { it.chain == chain }
+            if (fresh && have.isNotEmpty()) {
+                out += have
+                continue
+            }
+            val got = try {
+                if (chain == Chain.BASE) Api.listCoinbaseTokens() else Api.listRobinhoodTokens()
+            } catch (e: Exception) {
+                notes += "Elenco token ${chain.issuer} non disponibile${if (have.isNotEmpty()) ": uso quello salvato" else ""}"
+                null
+            }
+            if (got != null && got.isNotEmpty()) {
+                out += got
+                refreshed = true
+            } else {
+                out += have
+            }
         }
-        if (cached != null && cached.isNotEmpty() && now - st.tokensAt < TOKENS_TTL_MS) return cached
-        return try {
-            val fresh = Api.listTokens()
-            st.tokensJson = JSONArray().apply { fresh.forEach { put(it.toJson()) } }.toString()
+        if (refreshed) {
+            st.tokensJson = JSONArray().apply { out.forEach { put(it.toJson()) } }.toString()
             st.tokensAt = now
-            fresh
-        } catch (e: Exception) {
-            if (cached != null && cached.isNotEmpty()) cached else throw e
         }
+        if (out.isEmpty()) throw RuntimeException("Elenco token non disponibile")
+        return out
     }
 
     private fun <T> parallel(items: List<T>, threads: Int, block: (T) -> Unit) {
@@ -434,9 +522,9 @@ object Scanner {
         return out
     }
 
-    /** -> (prezzo per token, fonte, età in minuti). Priorità a Wall Street fresco, poi Chainlink. */
+    /** -> (prezzo per token, fonte, età in minuti). Priorità a Borsa fresca, poi Chainlink. */
     private fun pickFair(t: CbToken, w: RefQuote?, c: RefQuote?, now: Long, maxAge: Double): Triple<Double, String, Double>? {
-        fun age(r: RefQuote) = (now - r.asOfMillis) / 60000.0
+        fun age(r: RefQuote) = max(0.0, (now - r.asOfMillis) / 60000.0)
         return when {
             w != null && age(w) <= maxAge -> Triple(w.price * t.multiplier, w.source, age(w))
             c != null && age(c) <= maxAge -> Triple(c.price, c.source, age(c))

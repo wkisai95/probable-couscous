@@ -62,6 +62,7 @@ object Notifier {
     fun body(o: Opportunity): String = buildString {
         val b = o.best
         append("Gap ${o.gapBps.toInt()} bps · ${dexText(o)} vs Borsa ${px(o.fairPrice)}\n")
+        append("${o.chain.label} · ${o.dex ?: "?"}${o.liquidityUsd?.let { " · liq " + usd0(it) } ?: ""}\n")
         if (b != null) {
             append("${directionLabel(b.direction)}\n")
             append("Size ottimale ${usd0(b.notionalUsd)} (${qty(b.tokens)} ${o.symbol})\n")
@@ -95,7 +96,7 @@ object Notifier {
             alerts.put(key, org.json.JSONObject().put("at", now).put("gap", o.gapBps))
             val n = Notification.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat)
-                .setContentTitle("⚡ ${o.symbol}: netto ${usd(o.best?.netUsd ?: 0.0)}")
+                .setContentTitle("⚡ ${o.label}: netto ${usd(o.best?.netUsd ?: 0.0)} (${(o.best?.netBps ?: 0.0).toInt()} bps)")
                 .setContentText(o.best?.let { directionLabel(it.direction) } ?: "")
                 .setStyle(Notification.BigTextStyle().bigText(body(o)))
                 .setContentIntent(pi)
@@ -129,7 +130,7 @@ object Notifier {
                 if (post) {
                     val pct = (st.fraction * 100).roundToInt()
                     val text = buildString {
-                        append("Gap chiuso: vendi ${qty(st.sellTokens ?: 0.0)} ${p.symbol} ")
+                        append("Gap chiuso: vendi ${qty(st.sellTokens ?: 0.0)} ${p.label} ")
                         append("a ~${px(st.avgSellPrice ?: 0.0)} (Borsa ${px(st.fair ?: 0.0)})\n")
                         append("Incasso ~${usd(st.proceedsUsd ?: 0.0)} · risultato su questa parte ")
                         append(signedUsd(st.pnlUsd ?: 0.0) + "\n")
@@ -138,7 +139,7 @@ object Notifier {
                     }
                     val n = Notification.Builder(ctx, CHANNEL_POS)
                         .setSmallIcon(R.drawable.ic_stat)
-                        .setContentTitle("💰 ${p.symbol}: puoi vendere il $pct%")
+                        .setContentTitle("💰 ${p.label}: puoi vendere il $pct%")
                         .setContentText("Incasso ~${usd0(st.proceedsUsd ?: 0.0)} · ${signedUsd(st.pnlUsd ?: 0.0)}")
                         .setStyle(Notification.BigTextStyle().bigText(text))
                         .setContentIntent(openApp(ctx))

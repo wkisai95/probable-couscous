@@ -22,17 +22,22 @@ data class CbToken(
     val decimals: Int,
     val multiplier: Double,
     val pausedFeatures: List<Int> = emptyList(),
+    val chain: Chain = Chain.BASE,
 ) {
+    /** Nome mostrato: i token Robinhood hanno lo stesso simbolo dell'azione. */
+    val label: String get() = if (chain == Chain.ROBINHOOD) "$symbol (RH)" else symbol
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("a", address); put("s", symbol); put("t", ticker); put("n", name)
-        put("d", decimals); put("m", multiplier); put("p", JSONArray(pausedFeatures))
+        put("d", decimals); put("m", multiplier); put("p", JSONArray(pausedFeatures)); put("c", chain.name)
     }
 
     companion object {
         fun fromJson(o: JSONObject): CbToken {
             val p = o.optJSONArray("p") ?: JSONArray()
             return CbToken(o.getString("a"), o.getString("s"), o.getString("t"), o.optString("n"),
-                o.getInt("d"), o.getDouble("m"), (0 until p.length()).map { p.getInt(it) })
+                o.getInt("d"), o.getDouble("m"), (0 until p.length()).map { p.getInt(it) },
+                Chain.of(o.optString("c")))
         }
     }
 }
@@ -47,11 +52,11 @@ data class RefQuote(
     val perToken: Boolean = false,
 )
 
-/** Prezzo e liquidità della pool token/USDC scelta per un token. */
+/** Prezzo del token in una pool e liquidità della pool. */
 data class PoolPrice(
     val priceUsd: Double,
     val liquidityUsd: Double,
-    val dex: String,          // es. "aerodrome v3"
+    val dex: String,          // es. "uniswap v4 · WETH"
     val pair: String?,        // indirizzo della pool
 )
 
@@ -111,7 +116,10 @@ data class Opportunity(
     val actionable: Boolean,
     val verified: Boolean,       // size verificata con quote on-chain
     val notes: List<String>,
+    val chain: Chain = Chain.BASE,
 ) {
+    val label: String get() = if (chain == Chain.ROBINHOOD) "$symbol (RH)" else symbol
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("ticker", ticker); put("symbol", symbol); put("address", address)
         put("session", session); put("fair", fairPrice); put("refSource", refSource)
@@ -125,6 +133,7 @@ data class Opportunity(
         put("actionable", actionable)
         put("verified", verified)
         put("notes", JSONArray(notes))
+        put("chain", chain.name)
     }
 
     companion object {
@@ -142,6 +151,7 @@ data class Opportunity(
                 fixed = SizeResult.fromJson(o.optJSONObject("fixed")),
                 actionable = o.optBoolean("actionable"), verified = o.optBoolean("verified", true),
                 notes = (0 until n.length()).map { n.getString(it) },
+                chain = Chain.of(o.optString("chain")),
             )
         }
     }
@@ -193,16 +203,21 @@ data class Position(
     val entryPrice: Double,   // prezzo medio pagato per token
     val tokens: Double,       // token residui
     val openedAt: Long,
+    val chain: Chain = Chain.BASE,
 ) {
+    val label: String get() = if (chain == Chain.ROBINHOOD) "$symbol (RH)" else symbol
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id); put("address", address); put("symbol", symbol); put("ticker", ticker)
         put("usd", usd); put("entry", entryPrice); put("tokens", tokens); put("openedAt", openedAt)
+        put("chain", chain.name)
     }
 
     companion object {
         fun fromJson(o: JSONObject) = Position(
             o.getString("id"), o.getString("address"), o.getString("symbol"), o.getString("ticker"),
             o.getDouble("usd"), o.getDouble("entry"), o.getDouble("tokens"), o.getLong("openedAt"),
+            Chain.of(o.optString("chain")),
         )
     }
 }
