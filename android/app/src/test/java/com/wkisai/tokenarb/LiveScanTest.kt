@@ -23,6 +23,7 @@ class LiveScanTest {
     }
 
     private fun f(v: Double, d: Int = 2) = String.format(Locale.ITALY, "%.${d}f", v)
+    private fun liqText(o: Opportunity) = o.liquidityUsd?.takeIf { it >= 0 }?.let { "$${it.toInt()}" } ?: "n/d"
 
     @Test
     fun liveScan() {
@@ -73,9 +74,11 @@ class LiveScanTest {
                 val verified = list.count { it.verified }
                 val sized = list.count { it.best != null }
                 val profitable = list.count { (it.best?.netUsd ?: 0.0) > 0 }
-                val liq = list.mapNotNull { it.liquidityUsd }
+                val liq = list.mapNotNull { it.liquidityUsd }.filter { it >= 0 }
+                val kyberOnly = list.count { (it.liquidityUsd ?: 0.0) < 0 }
                 append("${chain.label}: ${list.size} con pool · verificati $verified · con size $sized · " +
-                    "in profitto $profitable · liquidità <$1k ${liq.count { it < 1e3 }}, <$10k ${liq.count { it < 1e4 }}\n")
+                    "in profitto $profitable · liquidità <$1k ${liq.count { it < 1e3 }}, <$10k ${liq.count { it < 1e4 }} · " +
+                    "solo KyberSwap $kyberOnly\n")
             }
         })
 
@@ -83,14 +86,14 @@ class LiveScanTest {
         section("Da comprare (netto positivo, per rendimento)", buys.take(30).joinToString("\n") { o ->
             val b = o.best!!
             "${o.label.padEnd(11)} ${o.chain.label.padEnd(10)} sconto ${(-o.gapBps).toInt()} bps · " +
-                "liq $${o.liquidityUsd?.toInt()} · size $${b.notionalUsd.toInt()} · netto $${f(b.netUsd)} " +
+                "liq ${liqText(o)} · size $${b.notionalUsd.toInt()} · netto $${f(b.netUsd)} " +
                 "(${b.netBps.toInt()} bps)${if (o.actionable) " ⚡" else ""} · ${o.dex}"
         }.ifEmpty { "nessuno in questo momento" })
 
         val discounts = out.opportunities.filter { it.gapBps < 0 && (it.best?.netUsd ?: -1.0) <= 0 }
             .sortedBy { it.gapBps }.take(25)
         section("Sconti scartati dopo la verifica", discounts.joinToString("\n") { o ->
-            "${o.label.padEnd(11)} sconto ${(-o.gapBps).toInt()} bps · liq $${o.liquidityUsd?.toInt()} · " +
+            "${o.label.padEnd(11)} sconto ${(-o.gapBps).toInt()} bps · liq ${liqText(o)} · " +
                 "acquisto on-chain ${o.dexBuy?.let { f(it) } ?: "-"} vs Borsa ${f(o.fairPrice)} · " +
                 (o.notes.lastOrNull() ?: "")
         }.ifEmpty { "nessuno" })

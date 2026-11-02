@@ -13,15 +13,18 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.random.Random
 
 /**
  * Scansione degli stock token Coinbase (Base) e Robinhood (Robinhood Chain) contro Wall Street.
  *  1. prezzi di Borsa: bid/ask Robinhood per tutti i titoli in una richiesta (riserva: Yahoo);
  *  2. DexScreener (pool principale di ogni token, ~1 s): confronto e arbitraggi subito a schermo,
  *     poi verifica on-chain (KyberSwap) dei candidati, i meno liquidi per primi;
- *  3. GeckoTerminal subito dopo: tutte le pool principali di ogni token, comprese le piccole,
- *     dove si trovano i prezzi sbagliati; i nuovi candidati vanno in verifica;
- *  4. controllo delle posizioni e fine della verifica on-chain.
+ *  3. controllo delle posizioni;
+ *  4. GeckoTerminal in background: tutte le pool principali di ogni token, comprese le piccole,
+ *     dove si trovano i prezzi sbagliati; i nuovi candidati vanno in verifica. Intanto i token
+ *     senza pool indicizzate vengono provati con un acquisto da $10 su KyberSwap (market maker,
+ *     pool non indicizzate); quelli senza nessun percorso si ricontrollano ogni ~6 ore.
  * Lo sconto di un token è quello della sua pool più economica (per comprare) o più cara (per vendere).
  */
 object Scanner {
@@ -35,7 +38,7 @@ object Scanner {
     private const val RETRY_TTL_MS = 3_600_000L          // errore temporaneo di KyberSwap: si riprova tra un'ora
     private const val DISCOVERY_USD = 10.0               // acquisto di prova per i token senza pool indicizzate
     private const val UNKNOWN_LIQ_USD = 4_000.0          // liquidità ipotizzata quando non è indicizzata
-    private const val DISCOVERY_THREADS = 3
+    private const val DISCOVERY_THREADS = 6              // il limite di 5 richieste/s di KyberSwap resta globale
     private const val YAHOO_THREADS = 8
     private const val KYBER_THREADS = 6
 
@@ -71,6 +74,9 @@ object Scanner {
 
     fun yahooSymbol(ticker: String) = ticker.replace('.', '-').replace('/', '-')
 
+    /** Scadenza sparsa tra il 75% e il 125% del periodo: i ricontrolli non arrivano tutti nella stessa scansione. */
+    private fun jitter(ttl: Long) = (ttl * (0.75 + 0.5 * Random.nextDouble())).toLong()
+
     private fun px(v: Double) = String.format(Locale.ITALY, "%.2f", v)
     private fun usd(v: Double) = String.format(Locale.ITALY, "$%,.2f", v)
     private fun usd0(v: Double) = String.format(Locale.ITALY, "$%,.0f", v)
@@ -100,6 +106,7 @@ object Scanner {
         val feed: MutableList<String> = Collections.synchronizedList(mutableListOf())
         st.noRoute.entries.removeAll { it.value < started }
         st.noPools.entries.removeAll { it.value < started }
+        val knownNoPools = st.noPools.keys.toSet()   // senza pool all'ultimo controllo di GeckoTerminal
         val opps = ConcurrentHashMap<String, Opportunity>()
         var total = 0
 
@@ -158,7 +165,7 @@ object Scanner {
                 failed += r.failed
                 // interrogati senza alcuna pool, né qui né su DexScreener: si salteranno per 6 ore
                 for (a in r.queried) {
-                    if (!r.pools.containsKey(a) && !dsPools.containsKey(a)) st.noPools[a] = started + NO_POOLS_TTL_MS
+                    if (!r.pools.containsKey(a) && !dsPools.containsKey(a)) st.noPools[a] = started + jitter(NO_POOLS_TTL_MS)
                     else st.noPools.remove(a)
                 }
             }
@@ -189,13 +196,18 @@ object Scanner {
         val queued = AtomicInteger(0)
         val done = AtomicInteger(0)
         val lastEmit = AtomicLong(0)
+        val discTotal = AtomicInteger(0)
+        val discDone = AtomicInteger(0)
 
         fun emitProgress(force: Boolean = false) {
             val now = System.currentTimeMillis()
             val prev = lastEmit.get()
             if ((force || now - prev >= 700) && lastEmit.compareAndSet(prev, now)) {
+                val dTot = discTotal.get()
+                val dDone = discDone.get()
+                val discNote = if (dDone < dTot) " · liquidità non indicizzata: $dDone/$dTot token" else ""
                 val gtNote = if (gtFuture.isDone) "" else " · pool piccole da GeckoTerminal in arrivo (fino a 1–2 min)…"
-                onUpdate(outcome(true, "Verifica on-chain: ${done.get()}/${queued.get()}$gtNote"))
+                onUpdate(outcome(true, "Verifica on-chain: ${done.get()}/${queued.get()}$discNote$gtNote"))
             }
         }
 
@@ -220,8 +232,12 @@ object Scanner {
             if (missing.isNotEmpty()) ws.putAll(fetchYahoo(missing))
         }
 
-        /** Confronto con Wall Street: sconto sulla pool più economica, rincaro sulla più cara. */
-        fun screen(tokens: List<CbToken>, pools: Map<String, List<PoolPrice>>) {
+        /**
+         * Confronto con Wall Street: sconto sulla pool più economica, rincaro sulla più cara.
+         * [buyQuotes]: i prezzi sono quote di acquisto (KyberSwap), che dicono solo se conviene comprare.
+         */
+        fun screen(tokens: List<CbToken>, pools: Map<String, List<PoolPrice>>, buyQuotes: Boolean = false) {
+            val buySide = s.buyOnly || buyQuotes
             val found = mutableListOf<Candidate>()
             for (t in tokens) {
                 val a = t.address.lowercase()
@@ -247,7 +263,7 @@ object Scanner {
                 val rich = list.maxBy { it.priceUsd }
                 val buyGap = (cheap.priceUsd - fairPx) / fairPx * 1e4
                 val sellGap = (rich.priceUsd - fairPx) / fairPx * 1e4
-                val useBuy = s.buyOnly || -buyGap >= sellGap
+                val useBuy = buySide || -buyGap >= sellGap
                 val pool = if (useBuy) cheap else rich
                 val gap = if (useBuy) buyGap else sellGap
                 val isHalted = t.ticker in halted
@@ -263,9 +279,9 @@ object Scanner {
                     notes = baseNotes(t, session, tradable, age, s, w, c, started) + extra,
                     chain = t.chain,
                 )
-                val relevant = if (s.buyOnly) gap <= -prefilter else abs(gap) >= prefilter
+                val relevant = if (buySide) gap <= -prefilter else abs(gap) >= prefilter
                 if (!relevant) {
-                    val why = if (s.buyOnly) "sconto inferiore a ${prefilter.toInt()} bps" else "gap sotto ${prefilter.toInt()} bps"
+                    val why = if (buySide) "sconto inferiore a ${prefilter.toInt()} bps" else "gap sotto ${prefilter.toInt()} bps"
                     opps[a] = base.copy(verified = true, notes = base.notes + why)
                 } else if (a in st.noRoute) {
                     opps[a] = base.copy(verified = true,
@@ -278,6 +294,43 @@ object Scanner {
             }
             // i token meno liquidi per primi: è lì che i prezzi si scostano di più
             found.sortedBy { it.poolLiq }.forEach { verify(it) }
+        }
+
+        // ---- token senza pool indicizzate: acquisto di prova da $10 con KyberSwap, che vede anche la
+        //      liquidità dei market maker e le pool non indicizzate; i non instradabili si saltano per ~6 ore
+        val probed = ConcurrentHashMap.newKeySet<String>()
+        val kyberFound = ConcurrentHashMap.newKeySet<String>()
+        fun discover(tokens: List<CbToken>) {
+            if (tokens.isEmpty()) return
+            tokens.forEach { probed += it.address.lowercase() }
+            discTotal.addAndGet(tokens.size)
+            emitProgress(force = true)
+            val found = ConcurrentHashMap<String, List<PoolPrice>>()
+            parallel(tokens, DISCOVERY_THREADS) { t ->
+                val a = t.address.lowercase()
+                val chain = t.chain
+                try {
+                    val q = Api.quote(chain, chain.stable, chain.stableDecimals, t.address, t.decimals, DISCOVERY_USD)
+                    if (q.amountOut > 0) {
+                        found[a] = listOf(PoolPrice(DISCOVERY_USD / q.amountOut, -1.0,
+                            "KyberSwap · liquidità non indicizzata", null))
+                    }
+                } catch (e: NoRouteException) {
+                    st.noRoute[a] = started + jitter(NO_ROUTE_TTL_MS)
+                } catch (e: Exception) {
+                    st.noRoute[a] = started + jitter(RETRY_TTL_MS)
+                } finally {
+                    discDone.incrementAndGet()
+                    emitProgress()
+                }
+            }
+            if (found.isNotEmpty()) {
+                kyberFound += found.keys
+                val tks = tokens.filter { found.containsKey(it.address.lowercase()) }
+                fillReference(tks)
+                screen(tks, found, buyQuotes = true)
+            }
+            emitProgress(force = true)
         }
 
         // ---- quadro con DexScreener: subito a schermo
@@ -302,6 +355,12 @@ object Scanner {
             })
             emitProgress(force = true)
         }
+
+        // ---- mentre GeckoTerminal lavora: KyberSwap sui token che all'ultimo controllo non avevano pool
+        discover(scope.filter {
+            val a = it.address.lowercase()
+            a in screenAddr && a in knownNoPools && !poolsBy.containsKey(a) && a !in st.noRoute
+        })
 
         // ---- GeckoTerminal: tutte le pool, comprese le più piccole
         val gt = try {
@@ -336,44 +395,18 @@ object Scanner {
             emitProgress(force = true)
         }
 
-        // ---- token senza pool indicizzate: acquisto di prova da $10 con KyberSwap, che vede anche la
-        //      liquidità dei market maker e le pool non indicizzate; i non instradabili si saltano per 6 ore
-        var kyberOnly = 0
-        val unpriced = scope.filter {
+        // ---- KyberSwap sugli altri token rimasti senza pool (alla prima scansione: tutti)
+        discover(scope.filter {
             val a = it.address.lowercase()
-            a in screenAddr && !poolsBy.containsKey(a) && a !in st.noRoute
-        }
-        if (unpriced.isNotEmpty()) {
-            onUpdate(outcome(true, "Cerco liquidità non indicizzata per ${unpriced.size} token…"))
-            val found = ConcurrentHashMap<String, List<PoolPrice>>()
-            parallel(unpriced, DISCOVERY_THREADS) { t ->
-                val a = t.address.lowercase()
-                val chain = t.chain
-                try {
-                    val q = Api.quote(chain, chain.stable, chain.stableDecimals, t.address, t.decimals, DISCOVERY_USD)
-                    if (q.amountOut > 0) {
-                        found[a] = listOf(PoolPrice(DISCOVERY_USD / q.amountOut, -1.0,
-                            "KyberSwap · liquidità non indicizzata", null))
-                    }
-                } catch (e: NoRouteException) {
-                    st.noRoute[a] = started + NO_ROUTE_TTL_MS
-                } catch (e: Exception) {
-                    st.noRoute[a] = started + RETRY_TTL_MS
-                }
-            }
-            if (found.isNotEmpty()) {
-                val tks = unpriced.filter { found.containsKey(it.address.lowercase()) }
-                fillReference(tks)
-                screen(tks, found)
-                kyberOnly = found.size
-            }
-            emitProgress(force = true)
-        }
+            a in screenAddr && !poolsBy.containsKey(a) && a !in st.noRoute && a !in probed
+        })
 
         // ---- fine della verifica on-chain
         verifyExec.shutdown()
         verifyExec.awaitTermination(8, TimeUnit.MINUTES)
 
+        // comprabili solo via KyberSwap: nessuna pool indicizzata, nemmeno da GeckoTerminal
+        val kyberOnly = kyberFound.count { a -> poolsBy[a]?.all { it.liquidityUsd < 0 } == true }
         val skipped = screenAddr.count { !poolsBy.containsKey(it) }
         val missingRef = synchronized(noRef) { noRef.sorted() }
         if (missingRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${missingRef.joinToString(", ")}"
@@ -382,7 +415,7 @@ object Scanner {
         }
         if (skipped > 0) {
             notes += "Senza liquidità on-chain: $skipped token. Non hanno pool e KyberSwap non riesce a " +
-                "comprarli, quindi non c'è un prezzo da confrontare; li ricontrollo ogni 6 ore"
+                "comprarli, quindi non c'è un prezzo da confrontare; li ricontrollo a turno ogni ~6 ore"
         }
         return outcome(false, "")
     }
@@ -413,7 +446,7 @@ object Scanner {
                 q.quote(Sizing.SELL, tk).amountOut / tk
             }
         } catch (e: NoRouteException) {
-            st.noRoute[t.address.lowercase()] = now + NO_ROUTE_TTL_MS
+            st.noRoute[t.address.lowercase()] = now + jitter(NO_ROUTE_TTL_MS)
             return c.base.copy(verified = true, notes = c.base.notes + "nessun percorso di scambio su KyberSwap")
         } catch (e: Exception) {
             return c.base.copy(verified = true, notes = c.base.notes + "quota non disponibile (${e.message?.take(60)})")

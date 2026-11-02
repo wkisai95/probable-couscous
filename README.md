@@ -89,6 +89,7 @@ La cartella `android/` contiene un'app nativa che fa le scansioni direttamente d
 **Come**
 - **Prezzo di Borsa**: bid/ask Robinhood di tutti i titoli con una sola richiesta (`/rhj/prices`); Yahoo come riserva per i titoli non coperti. I titoli sospesi vengono segnalati.
 - **Prezzi on-chain**: DexScreener (pool principale di ogni token, ~1 s) manda subito a schermo gli arbitraggi; GeckoTerminal parte subito dopo e aggiunge **tutte le pool principali di ogni token, comprese le più piccole** (da $20 di liquidità), dove i prezzi si scostano di più.
+- **Token senza pool indicizzate**: mentre GeckoTerminal lavora, l'app prova un acquisto da $10 su KyberSwap, che vede anche market maker e pool non indicizzate. Se il token si compra, il prezzo eseguibile entra nel confronto come gli altri. Se non c'è nessun percorso, il token viene ricontrollato a turno ogni ~6 ore senza rallentare le scansioni.
 - Lo sconto di un token è quello della sua **pool più economica**.
 - **Verifica on-chain** con KyberSwap sulla chain giusta (USDC su Base, USDG su Robinhood Chain). Si verificano prima i token meno liquidi; prova e scala di size sono proporzionate alla liquidità (da $10, mai oltre metà della liquidità del token).
 - I risultati sono ordinati per **rendimento netto %**; ogni scheda mostra chain, DEX e liquidità della pool.
@@ -115,6 +116,7 @@ L'APK viene compilato da GitHub Actions (`.github/workflows/android.yml`) a ogni
 - Feed prezzi: DexScreener risponde in **0,2 s** per tutti i token contro **24 s** di GeckoTerminal, con prezzi coerenti entro pochi decimi di punto; non indicizza però alcune pool Aero (es. TSLAc, MSTRc, MUc, la pool principale di AMZNc), che arrivano da GeckoTerminal nella stessa scansione. Confronto aggiornato: `python -m tokenarb feeds`.
 - La liquidità reale sta quasi tutta su **Aero** (`aero-slipstream-base`), poi Uniswap v4 e Aerodrome.
 - KyberSwap instrada tutti i token con liquidità reale; i 19 pool che non instrada hanno liquidità zero.
+- Su 470 token (267 Coinbase, 203 Robinhood) l'app trova un prezzo on-chain per **270**: 228 da pool indicizzate e 42 solo tramite KyberSwap (quasi tutti Robinhood). Gli altri **200** (197 Coinbase) non hanno liquidità on-chain: nessuna pool, o solo pool da pochi dollari, e KyberSwap non riesce a comprarli (02/11/2026). Verifica: *Actions → scanner → Run workflow → skipped*.
 - Per l'elenco aggiornato con i pool di ogni token: `python -m tokenarb tokens --liquidity`, oppure *Actions → scanner → Run workflow → tokens*.
 
 ## Test dal vivo dell'app
