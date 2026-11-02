@@ -79,13 +79,21 @@ Lo storico di ogni scansione finisce in `data/scans.csv`.
 
 ## App Android
 
-La cartella `android/` contiene un'app nativa che fa le stesse scansioni direttamente dal telefono:
-- scansiona ogni 15 minuti in background, con notifiche locali e senza server;
-- **prezzi on-chain a ogni scansione da DexScreener e poi GeckoTerminal**: DexScreener (pool token/USDC su Aero, ~0,2 s per tutti i token) manda subito a schermo gli arbitraggi; GeckoTerminal parte subito dopo, aggiunge i token che DexScreener non indicizza e sostituisce il prezzo quando trova una pool molto più liquida;
-- gli arbitraggi compaiono **subito** dopo il confronto con Wall Street; prezzo eseguibile, size ottimale e profitto netto vengono poi verificati on-chain con KyberSwap;
-- di base mostra solo i token che conviene comprare (sotto il prezzo di Borsa, con profitto netto positivo); dalle impostazioni si può tornare alla vista completa;
-- tocca una riga per i dettagli, tieni premuto per aprire la pool su DexScreener;
-- si regola dalle impostazioni nell'app: capitale, soglie, commissioni del broker, copertura in pre/after-market.
+La cartella `android/` contiene un'app nativa che fa le scansioni direttamente dal telefono, ogni 15 minuti in background, con notifiche locali e senza server.
+
+**Cosa scansiona**
+- **Stock token Coinbase su Base** (~218, elenco da `api.coinbase.com/v1/tokenized-stocks`).
+- **Stock token Robinhood su Robinhood Chain** (~203, elenco e multiplier da `api.robinhood.com/rhj/assets`). Si scambiano soprattutto su Uniswap contro USDG, WETH o SPY.
+- Ogni chain si attiva o disattiva dalle impostazioni.
+
+**Come**
+- **Prezzo di Borsa**: bid/ask Robinhood di tutti i titoli con una sola richiesta (`/rhj/prices`); Yahoo come riserva per i titoli non coperti. I titoli sospesi vengono segnalati.
+- **Prezzi on-chain**: DexScreener (pool principale di ogni token, ~1 s) manda subito a schermo gli arbitraggi; GeckoTerminal parte subito dopo e aggiunge **tutte le pool principali di ogni token, comprese le più piccole** (da $20 di liquidità), dove i prezzi si scostano di più.
+- Lo sconto di un token è quello della sua **pool più economica**.
+- **Verifica on-chain** con KyberSwap sulla chain giusta (USDC su Base, USDG su Robinhood Chain). Si verificano prima i token meno liquidi; prova e scala di size sono proporzionate alla liquidità (da $10, mai oltre metà della liquidità del token).
+- I risultati sono ordinati per **rendimento netto %**; ogni scheda mostra chain, DEX e liquidità della pool.
+- Di base mostra solo i token che conviene comprare (sotto il prezzo di Borsa, netto positivo); dalle impostazioni si può tornare alla vista completa.
+- Tocca una riga per i dettagli, tieni premuto per aprire la pool su DexScreener.
 
 **Posizioni e uscita**
 - Il pulsante **Ho comprato** registra l'acquisto (importo in USD e prezzo medio).
@@ -100,10 +108,15 @@ La cartella `android/` contiene un'app nativa che fa le stesse scansioni diretta
 
 L'APK viene compilato da GitHub Actions (`.github/workflows/android.yml`) a ogni modifica e pubblicato nelle Release. Gli aggiornamenti si installano sopra la versione precedente.
 
-## Copertura dei dati (verificata il 27/10/2026)
+## Copertura dei dati
 
-- **218 token** emessi da Coinbase su Base, **81** con almeno un pool DEX.
+- **218 token** Coinbase su Base, **81** con almeno un pool DEX (27/10/2026).
+- **203 token** Robinhood su Robinhood Chain, **118** con pool su DexScreener: 41 sopra $100k di liquidità, 36 sotto $10k (02/11/2026).
 - Feed prezzi: DexScreener risponde in **0,2 s** per tutti i token contro **24 s** di GeckoTerminal, con prezzi coerenti entro pochi decimi di punto; non indicizza però alcune pool Aero (es. TSLAc, MSTRc, MUc, la pool principale di AMZNc), che arrivano da GeckoTerminal nella stessa scansione. Confronto aggiornato: `python -m tokenarb feeds`.
 - La liquidità reale sta quasi tutta su **Aero** (`aero-slipstream-base`), poi Uniswap v4 e Aerodrome.
 - KyberSwap instrada tutti i token con liquidità reale; i 19 pool che non instrada hanno liquidità zero.
 - Per l'elenco aggiornato con i pool di ogni token: `python -m tokenarb tokens --liquidity`, oppure *Actions → scanner → Run workflow → tokens*.
+
+## Test dal vivo dell'app
+
+Il workflow *Android live scan test* (`.github/workflows/android-live-test.yml`) esegue il motore di scansione dell'app, lo stesso codice Kotlin che gira sul telefono, contro le API reali. Pubblica come annotazioni della run: tempi di ogni fase, copertura per chain, arbitraggi trovati, sconti scartati e note. Si avvia da *Actions → Android live scan test → Run workflow*.
