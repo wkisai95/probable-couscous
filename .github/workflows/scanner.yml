@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "scan = scansione · tokens = elenco token con i pool DEX · feeds = confronto feed prezzi"
+        description: "scan · tokens = pool DEX · feeds = confronto feed · probe = verifica fonti Robinhood"
         type: choice
-        options: [scan, tokens, feeds]
+        options: [scan, tokens, feeds, probe]
         default: scan
 
 concurrency:
@@ -60,6 +60,8 @@ jobs:
             python -m tokenarb tokens --liquidity
           elif [ "$CMD" = "feeds" ]; then
             python -m tokenarb feeds
+          elif [ "$CMD" = "probe" ]; then
+            python tools/probe.py
           else
             python -m tokenarb scan
           fi
