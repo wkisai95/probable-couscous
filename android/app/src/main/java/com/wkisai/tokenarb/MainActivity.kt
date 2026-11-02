@@ -340,7 +340,7 @@ class MainActivity : Activity() {
             append("Borsa ${Notifier.px(o.fairPrice)} · ${Notifier.dexText(o)}")
             append("\n${o.chain.label}")
             o.dex?.let { append(" · $it") }
-            o.liquidityUsd?.let { append(" · liq ${Notifier.usd0(it)}") }
+            o.liquidityUsd?.takeIf { it >= 0 }?.let { append(" · liq ${Notifier.usd0(it)}") }
             if (b != null) {
                 append("\n${Notifier.directionLabel(b.direction)} · size ${Notifier.usd0(b.notionalUsd)} (${b.netBps.toInt()} bps)")
             }

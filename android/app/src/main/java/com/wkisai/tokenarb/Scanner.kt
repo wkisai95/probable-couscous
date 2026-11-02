@@ -32,6 +32,10 @@ object Scanner {
     const val NO_ROUTE_TTL_MS = 6 * 3_600_000L
     private const val TOKENS_TTL_MS = 3_600_000L
     private const val NO_POOLS_TTL_MS = 6 * 3_600_000L
+    private const val RETRY_TTL_MS = 3_600_000L          // errore temporaneo di KyberSwap: si riprova tra un'ora
+    private const val DISCOVERY_USD = 10.0               // acquisto di prova per i token senza pool indicizzate
+    private const val UNKNOWN_LIQ_USD = 4_000.0          // liquidità ipotizzata quando non è indicizzata
+    private const val DISCOVERY_THREADS = 3
     private const val YAHOO_THREADS = 8
     private const val KYBER_THREADS = 6
 
@@ -222,7 +226,8 @@ object Scanner {
             for (t in tokens) {
                 val a = t.address.lowercase()
                 val list = pools[a]?.filter {
-                    it.priceUsd > 0 && it.priceUsd.isFinite() && (it.liquidityUsd >= MIN_POOL_USD || a in posAddr)
+                    it.priceUsd > 0 && it.priceUsd.isFinite() &&
+                        (it.liquidityUsd >= MIN_POOL_USD || it.liquidityUsd < 0 || a in posAddr)
                 } ?: continue
                 if (list.isEmpty()) continue
                 poolsBy[a] = list
@@ -331,6 +336,40 @@ object Scanner {
             emitProgress(force = true)
         }
 
+        // ---- token senza pool indicizzate: acquisto di prova da $10 con KyberSwap, che vede anche la
+        //      liquidità dei market maker e le pool non indicizzate; i non instradabili si saltano per 6 ore
+        var kyberOnly = 0
+        val unpriced = scope.filter {
+            val a = it.address.lowercase()
+            a in screenAddr && !poolsBy.containsKey(a) && a !in st.noRoute
+        }
+        if (unpriced.isNotEmpty()) {
+            onUpdate(outcome(true, "Cerco liquidità non indicizzata per ${unpriced.size} token…"))
+            val found = ConcurrentHashMap<String, List<PoolPrice>>()
+            parallel(unpriced, DISCOVERY_THREADS) { t ->
+                val a = t.address.lowercase()
+                val chain = t.chain
+                try {
+                    val q = Api.quote(chain, chain.stable, chain.stableDecimals, t.address, t.decimals, DISCOVERY_USD)
+                    if (q.amountOut > 0) {
+                        found[a] = listOf(PoolPrice(DISCOVERY_USD / q.amountOut, -1.0,
+                            "KyberSwap · liquidità non indicizzata", null))
+                    }
+                } catch (e: NoRouteException) {
+                    st.noRoute[a] = started + NO_ROUTE_TTL_MS
+                } catch (e: Exception) {
+                    st.noRoute[a] = started + RETRY_TTL_MS
+                }
+            }
+            if (found.isNotEmpty()) {
+                val tks = unpriced.filter { found.containsKey(it.address.lowercase()) }
+                fillReference(tks)
+                screen(tks, found)
+                kyberOnly = found.size
+            }
+            emitProgress(force = true)
+        }
+
         // ---- fine della verifica on-chain
         verifyExec.shutdown()
         verifyExec.awaitTermination(8, TimeUnit.MINUTES)
@@ -338,7 +377,13 @@ object Scanner {
         val skipped = screenAddr.count { !poolsBy.containsKey(it) }
         val missingRef = synchronized(noRef) { noRef.sorted() }
         if (missingRef.isNotEmpty()) notes += "Senza prezzo di Borsa: ${missingRef.joinToString(", ")}"
-        if (skipped > 0) notes += "Senza pool con liquidità: $skipped token (saltati)"
+        if (kyberOnly > 0) {
+            notes += "Comprabili solo via KyberSwap (market maker o pool non indicizzate): $kyberOnly token"
+        }
+        if (skipped > 0) {
+            notes += "Senza liquidità on-chain: $skipped token. Non hanno pool e KyberSwap non riesce a " +
+                "comprarli, quindi non c'è un prezzo da confrontare; li ricontrollo ogni 6 ore"
+        }
         return outcome(false, "")
     }
 
@@ -358,7 +403,7 @@ object Scanner {
             else Api.quote(chain, t.address, t.decimals, chain.stable, chain.stableDecimals, amt)
         }
         // prova proporzionata alla pool: in una pool da $300 anche $100 sposterebbero il prezzo
-        val probeUsd = (c.poolLiq * 0.005).coerceIn(5.0, 100.0)
+        val probeUsd = if (c.poolLiq < 0) DISCOVERY_USD else (c.poolLiq * 0.005).coerceIn(5.0, 100.0)
         val dir = if (c.gap < 0) Sizing.BUY else Sizing.SELL
         val px: Double = try {
             if (dir == Sizing.BUY) {
@@ -384,7 +429,8 @@ object Scanner {
                 notes = c.base.notes + "il prezzo eseguibile (${px(px)}) non copre i costi della copertura")
         }
         // scala di size adattata alla liquidità: mai oltre metà della liquidità totale del token
-        val cap = max(50.0, c.totalLiq * 0.5)
+        val liq = if (c.totalLiq < 0) UNKNOWN_LIQ_USD else c.totalLiq
+        val cap = max(50.0, liq * 0.5)
         val maxN = min(s.maxNotional, cap)
         val ladder = LADDER.filter { it <= maxN }
         val fixedSize = s.tradeSize.takeIf { it <= maxN }

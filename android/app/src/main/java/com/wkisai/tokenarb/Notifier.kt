@@ -62,7 +62,7 @@ object Notifier {
     fun body(o: Opportunity): String = buildString {
         val b = o.best
         append("Gap ${o.gapBps.toInt()} bps · ${dexText(o)} vs Borsa ${px(o.fairPrice)}\n")
-        append("${o.chain.label} · ${o.dex ?: "?"}${o.liquidityUsd?.let { " · liq " + usd0(it) } ?: ""}\n")
+        append("${o.chain.label} · ${o.dex ?: "?"}${o.liquidityUsd?.takeIf { it >= 0 }?.let { " · liq " + usd0(it) } ?: ""}\n")
         if (b != null) {
             append("${directionLabel(b.direction)}\n")
             append("Size ottimale ${usd0(b.notionalUsd)} (${qty(b.tokens)} ${o.symbol})\n")
