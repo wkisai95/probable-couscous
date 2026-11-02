@@ -4,7 +4,7 @@ package com.wkisai.tokenarb
 data class Settings(
     val maxNotional: Double = 25_000.0,
     val tradeSize: Double = 1_000.0,
-    val minProfit: Double = 5.0,       // i token poco liquidi danno profitti piccoli ma rendimenti alti
+    val minProfit: Double = 2.0,       // i token poco liquidi danno profitti piccoli ma rendimenti alti
     val minBps: Double = 30.0,
     val feePerShare: Double = 0.005,
     val feeBps: Double = 0.0,

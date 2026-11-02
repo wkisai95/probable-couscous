@@ -267,16 +267,23 @@ object Api {
     }
 
     // ---------------------------------------------------------------- GeckoTerminal
-    /** Pausa tra le richieste: GeckoTerminal rifiuta (HTTP 429) le richieste ravvicinate o parallele. */
-    private const val GECKO_GAP_MS = 1_200L
+    /**
+     * Pausa tra le richieste: l'API pubblica di GeckoTerminal accetta ~30 richieste al minuto e
+     * rifiuta (HTTP 429) quelle ravvicinate o parallele.
+     */
+    private const val GECKO_GAP_MS = 2_100L
+
+    /** Esito di GeckoTerminal: pool trovate, richieste fallite, indirizzi effettivamente interrogati. */
+    class GeckoResult(val pools: Map<String, List<PoolPrice>>, val failed: Int, val queried: Set<String>)
 
     /**
      * Tutte le pool principali di ogni token da GeckoTerminal, ognuna con il proprio prezzo:
      * trova le pool piccole che DexScreener non riporta. Richieste in sequenza, a blocchi di 30,
      * con pausa e attese crescenti se il servizio limita la frequenza. -> (pool per indirizzo, richieste fallite)
      */
-    fun gecko(chain: Chain, addresses: List<String>): Pair<Map<String, List<PoolPrice>>, Int> {
+    fun gecko(chain: Chain, addresses: List<String>): GeckoResult {
         val out = ConcurrentHashMap<String, List<PoolPrice>>()
+        val queried = mutableSetOf<String>()
         var failed = 0
         val headers = mapOf("Accept" to "application/json;version=20230302")
         for ((i, chunk) in addresses.chunked(30).withIndex()) {
@@ -302,11 +309,12 @@ object Api {
             }
             try {
                 parseGecko(JSONObject(text), out)
+                queried += chunk.map { it.lowercase() }
             } catch (e: Exception) {
                 failed++
             }
         }
-        return Pair(out, failed)
+        return GeckoResult(out, failed, queried)
     }
 
     private fun parseGecko(o: JSONObject, out: ConcurrentHashMap<String, List<PoolPrice>>) {
@@ -342,8 +350,8 @@ object Api {
     }
 
     // ---------------------------------------------------------------- KyberSwap
-    /** Massimo ~8 richieste al secondo verso KyberSwap, anche da più thread. */
-    private const val KYBER_MIN_INTERVAL_MS = 125L
+    /** Massimo 5 richieste al secondo verso KyberSwap, anche da più thread (oltre arrivano rifiuti). */
+    private const val KYBER_MIN_INTERVAL_MS = 200L
     private val kyberLock = Any()
     private var kyberNext = 0L
 
@@ -372,7 +380,7 @@ object Api {
                 val code = err?.optInt("code", -1) ?: -1
                 if (code in NO_ROUTE_CODES) throw NoRouteException("KyberSwap $code: ${err?.optString("message")}")
                 if ((e.status == 429 || e.status >= 500) && attempt < 2) {
-                    Thread.sleep(1_000L * (attempt + 1))
+                    Thread.sleep(1_500L * (attempt + 1))
                     continue
                 }
                 throw RuntimeException("KyberSwap HTTP ${e.status}: ${err?.optString("message") ?: e.body.take(120)}")

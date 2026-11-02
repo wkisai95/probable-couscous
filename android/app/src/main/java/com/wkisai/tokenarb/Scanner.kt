@@ -31,6 +31,7 @@ object Scanner {
     const val MAX_PLAUSIBLE_GAP_BPS = 5_000.0
     const val NO_ROUTE_TTL_MS = 6 * 3_600_000L
     private const val TOKENS_TTL_MS = 3_600_000L
+    private const val NO_POOLS_TTL_MS = 6 * 3_600_000L
     private const val YAHOO_THREADS = 8
     private const val KYBER_THREADS = 6
 
@@ -53,6 +54,7 @@ object Scanner {
         var tokensJson: String?,
         var tokensAt: Long,
         val noRoute: MutableMap<String, Long>,
+        val noPools: MutableMap<String, Long> = ConcurrentHashMap(),   // token senza pool: ricontrollo ogni 6 ore
     )
 
     private class Candidate(
@@ -66,6 +68,8 @@ object Scanner {
     fun yahooSymbol(ticker: String) = ticker.replace('.', '-').replace('/', '-')
 
     private fun px(v: Double) = String.format(Locale.ITALY, "%.2f", v)
+    private fun usd(v: Double) = String.format(Locale.ITALY, "$%,.2f", v)
+    private fun usd0(v: Double) = String.format(Locale.ITALY, "$%,.0f", v)
 
     /** Esegue una scansione; restituisce null se ce n'è già una in corso. */
     fun runExclusive(
@@ -91,6 +95,7 @@ object Scanner {
         val notes: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val feed: MutableList<String> = Collections.synchronizedList(mutableListOf())
         st.noRoute.entries.removeAll { it.value < started }
+        st.noPools.entries.removeAll { it.value < started }
         val opps = ConcurrentHashMap<String, Opportunity>()
         var total = 0
 
@@ -135,16 +140,23 @@ object Scanner {
         feed += "DexScreener ${System.currentTimeMillis() - t0} ms"
         if (dsFailed > 0) notes += "DexScreener: $dsFailed richieste fallite"
 
-        // ---- 2. GeckoTerminal parte subito dopo, in background
+        // ---- 2. GeckoTerminal parte subito dopo, in background: tutti i token tranne quelli
+        //         che all'ultimo controllo non avevano nessuna pool (ricontrollati ogni 6 ore)
         val gtStart = System.currentTimeMillis()
+        val gtScope = scope.filter { val a = it.address.lowercase(); dsPools.containsKey(a) || a !in st.noPools }
         val gtExec = Executors.newSingleThreadExecutor()
         val gtFuture = gtExec.submit<Pair<Map<String, List<PoolPrice>>, Int>> {
             val all = mutableMapOf<String, List<PoolPrice>>()
             var failed = 0
             for (chain in chains) {
-                val (m, f) = Api.gecko(chain, scope.filter { it.chain == chain }.map { it.address })
-                all.putAll(m)
-                failed += f
+                val r = Api.gecko(chain, gtScope.filter { it.chain == chain }.map { it.address })
+                all.putAll(r.pools)
+                failed += r.failed
+                // interrogati senza alcuna pool, né qui né su DexScreener: si salteranno per 6 ore
+                for (a in r.queried) {
+                    if (!r.pools.containsKey(a) && !dsPools.containsKey(a)) st.noPools[a] = started + NO_POOLS_TTL_MS
+                    else st.noPools.remove(a)
+                }
             }
             Pair(all, failed)
         }
@@ -270,6 +282,22 @@ object Scanner {
         screen(dsTokens, dsPools)
         emitProgress(force = true)
 
+        // ---- posizioni: controllate subito, senza aspettare GeckoTerminal
+        if (positions.isNotEmpty()) {
+            val needRef = positions.mapNotNull { byAddr[it.address.lowercase()] }
+            fillReference(needRef)
+            onPositions(positions.map { p ->
+                val a = p.address.lowercase()
+                val t = byAddr[a]
+                val fair = fairBy[a] ?: t?.let { tok ->
+                    pickFair(tok, ws[tok.ticker], if (tok.chain == Chain.BASE) cl[tok.ticker] else null,
+                        started, s.maxRefAgeMin)?.first
+                }
+                checkPosition(p, t, fair, poolsBy[a] ?: dsPools[a], session, s, started)
+            })
+            emitProgress(force = true)
+        }
+
         // ---- GeckoTerminal: tutte le pool, comprese le più piccole
         val gt = try {
             gtFuture.get(150, TimeUnit.SECONDS)
@@ -280,7 +308,8 @@ object Scanner {
             notes += "GeckoTerminal non disponibile in questa scansione: alcune pool potrebbero mancare"
         } else {
             val (gtPools, gtFailed) = gt
-            feed += "GeckoTerminal " + String.format(Locale.ITALY, "%.1f s", (System.currentTimeMillis() - gtStart) / 1000.0)
+            feed += "GeckoTerminal " + String.format(Locale.ITALY, "%.1f s", (System.currentTimeMillis() - gtStart) / 1000.0) +
+                " (${gtScope.size} token)"
             if (gtFailed > 0) notes += "GeckoTerminal: $gtFailed richieste fallite"
             // unione delle pool delle due fonti; si riesaminano i token con pool nuove
             val merged = mutableMapOf<String, List<PoolPrice>>()
@@ -300,15 +329,6 @@ object Scanner {
                 screen(changed, merged)
             }
             emitProgress(force = true)
-        }
-
-        // ---- posizioni, con le pool di entrambe le fonti
-        if (positions.isNotEmpty()) {
-            onUpdate(outcome(true, "Controllo le tue posizioni…"))
-            onPositions(positions.map { p ->
-                val a = p.address.lowercase()
-                checkPosition(p, byAddr[a], fairBy[a], poolsBy[a], session, s, started)
-            })
         }
 
         // ---- fine della verifica on-chain
@@ -371,8 +391,14 @@ object Scanner {
         val (best, fixed) = Sizing.search(dir, fair, q, costs, ladder, maxN, fixedSize)
         val actionable = best != null && !c.halted && session in tradable && c.base.refAgeMin <= s.maxRefAgeMin &&
             t.pausedFeatures.isEmpty() && best.netUsd >= s.minProfit && best.netBps >= s.minBps
+        val why = when {
+            best == null -> "quote non disponibili per le size provate (riprova alla prossima scansione)"
+            best.netUsd <= 0 -> "netto negativo a ogni size: il migliore è ${usd(best.netUsd)} con ${usd0(best.notionalUsd)} " +
+                "(lordo ${usd(best.grossUsd)}, costi ${usd(best.costsUsd)} tra gas e copertura)"
+            else -> null
+        }
         return c.base.copy(dexBuy = buyPx, dexSell = sellPx, best = best, fixed = fixed,
-            actionable = actionable, verified = true)
+            actionable = actionable, verified = true, notes = c.base.notes + listOfNotNull(why))
     }
 
     /**
@@ -394,10 +420,6 @@ object Scanner {
         if (p.tokens <= 0) return status(note = "posizione vuota")
         val target = fair * (1 - s.closeTolBps / 1e4)
         val closed = if (session != "regular") "Borsa ${Market.label(session)}: confronto con l'ultimo prezzo" else null
-        if (spot != null && spot < target) {
-            val gap = (spot - fair) / fair * 1e4
-            return status(note = listOfNotNull("gap ancora aperto (${gap.toInt()} bps)", closed).joinToString(" · "))
-        }
         val chain = t.chain
         var lo = 0
         var hi = 10
@@ -421,7 +443,8 @@ object Scanner {
         }
         val q = bestQ
         if (bestK == 0 || q == null) {
-            return status(note = listOfNotNull("il prezzo di vendita eseguibile non chiude ancora il gap", closed)
+            val gap = spot?.let { " (pool ${((it - fair) / fair * 1e4).toInt()} bps)" } ?: ""
+            return status(note = listOfNotNull("gap ancora aperto: la vendita del 10% non arriva al prezzo di Borsa$gap", closed)
                 .joinToString(" · "))
         }
         val f = bestK / 10.0

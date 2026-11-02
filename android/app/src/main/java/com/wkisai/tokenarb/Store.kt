@@ -75,7 +75,8 @@ object Store {
         return Scanner.State(
             tokensJson = p.getString("tokens_cache", null),
             tokensAt = p.getLong("tokens_cache_at", 0L),
-            noRoute = ConcurrentHashMap(loadNoRoute(ctx)),
+            noRoute = ConcurrentHashMap(loadTimes(ctx, "no_route")),
+            noPools = ConcurrentHashMap(loadTimes(ctx, "no_pools")),
         )
     }
 
@@ -86,13 +87,15 @@ object Store {
             .remove("discovery_cache")
             .remove("discovery_cache_at")
             .apply()
-        saveNoRoute(ctx, st.noRoute)
+        saveTimes(ctx, "no_route", st.noRoute)
+        saveTimes(ctx, "no_pools", st.noPools)
     }
 
-    private fun loadNoRoute(ctx: Context): MutableMap<String, Long> {
+    /** Mappa indirizzo -> momento in cui ricontrollare (token senza percorso o senza pool). */
+    private fun loadTimes(ctx: Context, key: String): MutableMap<String, Long> {
         val out = mutableMapOf<String, Long>()
         try {
-            val o = JSONObject(prefs(ctx).getString("no_route", "{}") ?: "{}")
+            val o = JSONObject(prefs(ctx).getString(key, "{}") ?: "{}")
             o.keys().forEach { k -> out[k] = o.getLong(k) }
         } catch (e: Exception) {
             // stato illeggibile: si riparte da zero
@@ -100,10 +103,10 @@ object Store {
         return out
     }
 
-    private fun saveNoRoute(ctx: Context, m: Map<String, Long>) {
+    private fun saveTimes(ctx: Context, key: String, m: Map<String, Long>) {
         val o = JSONObject()
         m.forEach { (k, v) -> o.put(k, v) }
-        prefs(ctx).edit().putString("no_route", o.toString()).apply()
+        prefs(ctx).edit().putString(key, o.toString()).apply()
     }
 
     // ------------------------------------------------------------ posizioni
