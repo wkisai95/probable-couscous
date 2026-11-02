@@ -12,7 +12,10 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings as AndroidSettings
 import android.text.InputType
 import android.view.Gravity
@@ -35,16 +38,42 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
+    companion object {
+        private const val PAGE = 40
+        private const val RENDER_INTERVAL_MS = 800L
+    }
+
     private lateinit var status: TextView
     private lateinit var posBox: LinearLayout
     private lateinit var list: LinearLayout
     private lateinit var scanBtn: Button
     private lateinit var batteryBtn: Button
     private val expanded = mutableSetOf<String>()
+    private var limit = PAGE
+
+    // aggiornamenti della schermata accorpati: al massimo uno ogni RENDER_INTERVAL_MS
+    private val handler = Handler(Looper.getMainLooper())
+    private var renderQueued = false
+    private var lastRenderAt = 0L
+
+    private val liveListener: () -> Unit = { requestRender() }
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == Store.KEY_RESULTS || key == Store.KEY_POSITIONS || key == Store.KEY_POS_STATUS) {
-            runOnUiThread { render() }
+        if (key == Store.KEY_POSITIONS || key == Store.KEY_POS_STATUS) requestRender()
+    }
+
+    /** Chiede un aggiornamento della schermata; sicuro da qualsiasi thread. */
+    private fun requestRender() {
+        handler.post {
+            if (!renderQueued) {
+                renderQueued = true
+                val wait = max(0L, RENDER_INTERVAL_MS - (SystemClock.uptimeMillis() - lastRenderAt))
+                handler.postDelayed({
+                    renderQueued = false
+                    lastRenderAt = SystemClock.uptimeMillis()
+                    if (!isFinishing && !isDestroyed) render()
+                }, wait)
+            }
         }
     }
 
@@ -80,12 +109,27 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
         ScanWorker.schedule(this)
-        if (Store.loadResults(this) == null) scanNow()
+        // l'ultimo risultato si legge dal file fuori dal thread dell'interfaccia
+        val ctx = applicationContext
+        thread {
+            val last = Store.loadResults(ctx)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                render()
+                if (last == null && !Scanner.isRunning) scanNow()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
         Store.prefs(this).registerOnSharedPreferenceChangeListener(prefListener)
+        LiveState.addListener(liveListener)
         val pm = getSystemService(PowerManager::class.java)
         batteryBtn.visibility = if (pm.isIgnoringBatteryOptimizations(packageName)) View.GONE else View.VISIBLE
         render()
@@ -94,6 +138,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         Store.prefs(this).unregisterOnSharedPreferenceChangeListener(prefListener)
+        LiveState.removeListener(liveListener)
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -127,10 +172,11 @@ class MainActivity : Activity() {
         }
         scanBtn.isEnabled = false
         scanBtn.text = "Scansione in corso…"
+        limit = PAGE
         val ctx = applicationContext
         thread {
             ScanWorker.runScan(ctx)
-            runOnUiThread { render() }
+            requestRender()
         }
     }
 
@@ -153,7 +199,7 @@ class MainActivity : Activity() {
         val running = Scanner.isRunning
         scanBtn.isEnabled = !running
         scanBtn.text = if (running) "Scansione in corso…" else "Scansiona ora"
-        val out = Store.loadResults(this)
+        val out = LiveState.outcome   // in memoria: nessuna lettura dal disco
         list.removeAllViews()
         if (out == null) {
             status.text = if (running) "⏳ Prima scansione in corso…"
@@ -200,7 +246,19 @@ class MainActivity : Activity() {
         if (Store.loadPositions(this).isNotEmpty() && shown.isNotEmpty()) {
             list.addView(sectionTitle(if (s.buyOnly) "Token da comprare" else "Arbitraggi"))
         }
-        for (o in shown) list.addView(card(o))
+        // le schede si costruiscono a blocchi: con centinaia di token la schermata resta fluida
+        for (o in shown.take(limit)) list.addView(card(o))
+        val hidden = shown.size - limit
+        if (hidden > 0) {
+            list.addView(Button(this).apply {
+                text = "Mostra altri ${minOf(PAGE, hidden)} ($hidden nascosti)"
+                isAllCaps = false
+                setOnClickListener {
+                    limit += PAGE
+                    render()
+                }
+            })
+        }
     }
 
     private fun sectionTitle(t: String) = TextView(this).apply {

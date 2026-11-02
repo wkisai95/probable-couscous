@@ -190,7 +190,7 @@ object Scanner {
             val now = System.currentTimeMillis()
             val prev = lastEmit.get()
             if ((force || now - prev >= 700) && lastEmit.compareAndSet(prev, now)) {
-                val gtNote = if (gtFuture.isDone) "" else " · GeckoTerminal in arrivo…"
+                val gtNote = if (gtFuture.isDone) "" else " · pool piccole da GeckoTerminal in arrivo (fino a 1–2 min)…"
                 onUpdate(outcome(true, "Verifica on-chain: ${done.get()}/${queued.get()}$gtNote"))
             }
         }

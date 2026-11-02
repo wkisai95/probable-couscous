@@ -35,7 +35,7 @@ class ScanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             return try {
                 val outcome = Scanner.runExclusive(
                     s, st, positions,
-                    onUpdate = { partial -> Store.saveResults(ctx, partial) },
+                    onUpdate = { partial -> Store.publishProgress(partial) },   // in memoria, niente disco
                     onPositions = { statuses -> Notifier.notifyPositions(ctx, positions, statuses, s) },
                 )
                 if (outcome != null) {

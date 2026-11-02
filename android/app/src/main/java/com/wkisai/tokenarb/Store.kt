@@ -4,11 +4,12 @@ import android.content.Context
 import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 object Store {
     private const val PREFS = "tokenarb"
-    const val KEY_RESULTS = "last_scan"
+    private const val KEY_RESULTS = "last_scan"   // solo per ripulire le versioni precedenti
     const val KEY_POSITIONS = "positions"
     const val KEY_POS_STATUS = "position_status"
     private const val KEY_ALERTS = "alerts"
@@ -47,9 +48,42 @@ object Store {
         )
     }
 
+    // ------------------------------------------------------------ file
+    // I dati grandi (risultati, elenco token) stanno in file, non nelle preferenze: le preferenze
+    // vengono riscritte per intero a ogni modifica e, se pesanti, bloccano l'interfaccia.
+    private const val RESULTS_FILE = "last_scan.json"
+    private const val TOKENS_FILE = "tokens_cache.json"
+
+    private fun file(ctx: Context, name: String) = File(ctx.applicationContext.filesDir, name)
+
+    private fun writeAtomic(ctx: Context, name: String, text: String) {
+        val target = file(ctx, name)
+        val tmp = File(target.parentFile, "$name.tmp")
+        tmp.writeText(text)
+        if (!tmp.renameTo(target)) {
+            target.delete()
+            tmp.renameTo(target)
+        }
+    }
+
+    private fun readFile(ctx: Context, name: String): String? = try {
+        file(ctx, name).takeIf { it.exists() }?.readText()
+    } catch (e: Exception) {
+        null
+    }
+
     // ------------------------------------------------------------ risultati
+    /** Avanzamento della scansione: solo in memoria, nessuna scrittura su disco. */
+    fun publishProgress(o: ScanOutcome) = LiveState.publish(o)
+
+    /** Risultato finale: in memoria per la schermata e su file per i riavvii. */
     fun saveResults(ctx: Context, o: ScanOutcome) {
-        prefs(ctx).edit().putString(KEY_RESULTS, o.toJson().toString()).apply()
+        LiveState.publish(o)
+        try {
+            writeAtomic(ctx, RESULTS_FILE, o.toJson().toString())
+        } catch (e: Exception) {
+            // il risultato resta comunque in memoria
+        }
     }
 
     /** Conserva l'ultima lista valida e registra l'errore tra le note. */
@@ -62,31 +96,44 @@ object Store {
         ))
     }
 
-    fun loadResults(ctx: Context): ScanOutcome? = try {
-        prefs(ctx).getString(KEY_RESULTS, null)?.let { ScanOutcome.fromJson(JSONObject(it)) }
-    } catch (e: Exception) {
-        null
+    /** Ultimo risultato: dalla memoria o, dopo un riavvio, dal file. Da chiamare fuori dal thread UI. */
+    fun loadResults(ctx: Context): ScanOutcome? {
+        LiveState.outcome?.let { return it }
+        val fromDisk = readFile(ctx, RESULTS_FILE)?.let {
+            try { ScanOutcome.fromJson(JSONObject(it)) } catch (e: Exception) { null }
+        }
+        if (fromDisk != null) LiveState.restore(fromDisk)
+        return LiveState.outcome
     }
 
     // ------------------------------------------------------------ stato tra le scansioni
-    /** Elenco token in cache e token senza percorso di scambio. */
+    /** Elenco token in cache (file) e token senza percorso o senza pool (preferenze). */
     fun loadState(ctx: Context): Scanner.State {
         val p = prefs(ctx)
+        // pulizia delle versioni precedenti, che tenevano dati grandi nelle preferenze
+        if (p.contains(KEY_RESULTS) || p.contains("tokens_cache") || p.contains("discovery_cache")) {
+            p.edit().remove(KEY_RESULTS).remove("tokens_cache").remove("tokens_cache_at")
+                .remove("discovery_cache").remove("discovery_cache_at").apply()
+        }
         return Scanner.State(
-            tokensJson = p.getString("tokens_cache", null),
-            tokensAt = p.getLong("tokens_cache_at", 0L),
+            tokensJson = readFile(ctx, TOKENS_FILE),
+            tokensAt = p.getLong("tokens_file_at", 0L),
             noRoute = ConcurrentHashMap(loadTimes(ctx, "no_route")),
             noPools = ConcurrentHashMap(loadTimes(ctx, "no_pools")),
         )
     }
 
     fun saveState(ctx: Context, st: Scanner.State) {
-        prefs(ctx).edit()
-            .putString("tokens_cache", st.tokensJson)
-            .putLong("tokens_cache_at", st.tokensAt)
-            .remove("discovery_cache")
-            .remove("discovery_cache_at")
-            .apply()
+        val p = prefs(ctx)
+        val json = st.tokensJson
+        if (json != null && st.tokensAt != p.getLong("tokens_file_at", 0L)) {
+            try {
+                writeAtomic(ctx, TOKENS_FILE, json)
+                p.edit().putLong("tokens_file_at", st.tokensAt).apply()
+            } catch (e: Exception) {
+                // senza cache si riscarica l'elenco alla prossima scansione
+            }
+        }
         saveTimes(ctx, "no_route", st.noRoute)
         saveTimes(ctx, "no_pools", st.noPools)
     }
